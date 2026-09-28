@@ -62,21 +62,21 @@ func TestMVMemoryBalanceFold(t *testing.T) {
 	require.True(t, m.record(3, 0, mvBalanceExec(mvTestAddr, 50)))
 	require.True(t, m.record(4, 0, mvDeltaExec(mvTestAddr, 51, 1)))
 
-	val, res := m.resolveBalance(mvTestAddr, 3, nil)
+	val, res := m.resolveBalance(mvTestAddr, 3)
 	require.Equal(t, -1, res.blocking)
 	require.Equal(t, uint64(112), val.Uint64())
 	require.Equal(t, originSnapshot, res.origin.kind)
-	require.Equal(t, []txVersion{{txIdx: 2}, {txIdx: 1}}, res.fold)
+	require.Equal(t, 2, res.deltas)
 
-	val, res = m.resolveBalance(mvTestAddr, 5, nil)
+	val, res = m.resolveBalance(mvTestAddr, 5)
 	require.Equal(t, uint64(51), val.Uint64())
 	require.Equal(t, readOrigin{kind: originVersion, version: txVersion{txIdx: 3}}, res.origin)
-	require.Equal(t, []txVersion{{txIdx: 4}}, res.fold)
+	require.Equal(t, 1, res.deltas)
 
-	val, res = m.resolveBalance(mvTestAddr, 1, nil)
+	val, res = m.resolveBalance(mvTestAddr, 1)
 	require.Equal(t, uint64(100), val.Uint64())
 	require.Equal(t, originSnapshot, res.origin.kind)
-	require.Empty(t, res.fold)
+	require.Zero(t, res.deltas)
 }
 
 func TestMVMemoryEstimateInFold(t *testing.T) {
@@ -87,20 +87,20 @@ func TestMVMemoryEstimateInFold(t *testing.T) {
 	m.record(2, 0, mvDeltaExec(mvTestAddr, 112, 7))
 	m.convertWritesToEstimates(2)
 
-	_, res := m.resolveBalance(mvTestAddr, 3, nil)
+	_, res := m.resolveBalance(mvTestAddr, 3)
 	require.Equal(t, 2, res.blocking)
 
-	val, res := m.resolveBalance(mvTestAddr, 2, nil)
+	val, res := m.resolveBalance(mvTestAddr, 2)
 	require.Equal(t, -1, res.blocking)
 	require.Equal(t, uint64(105), val.Uint64())
-	require.Equal(t, []txVersion{{txIdx: 1}}, res.fold)
+	require.Equal(t, 1, res.deltas)
 
 	// A new incarnation replaces the estimate and readers resolve again.
 	require.False(t, m.record(2, 1, mvDeltaExec(mvTestAddr, 115, 10)))
-	val, res = m.resolveBalance(mvTestAddr, 3, nil)
+	val, res = m.resolveBalance(mvTestAddr, 3)
 	require.Equal(t, -1, res.blocking)
 	require.Equal(t, uint64(115), val.Uint64())
-	require.Equal(t, []txVersion{{txIdx: 2, incarnation: 1}, {txIdx: 1}}, res.fold)
+	require.Equal(t, 2, res.deltas)
 }
 
 func TestMVMemoryStorageClearOrdering(t *testing.T) {
@@ -172,7 +172,7 @@ func TestMVMemoryValidateReadSetModes(t *testing.T) {
 
 	// tx3 reads the slot (from tx1) and addr2's balance (from the snapshot).
 	slotVal, slotRes := m.resolveStorage(mvTestAddr, mvTestSlot, 3)
-	balVal, balRes := m.resolveBalance(mvTestAddr2, 3, nil)
+	balVal, balRes := m.resolveBalance(mvTestAddr2, 3)
 	reads := []mvRead{
 		{key: stateAccessKey{kind: stateAccessStorage, address: mvTestAddr, slot: mvTestSlot}, origin: slotRes.origin},
 		{key: stateAccessKey{kind: stateAccessBalance, address: mvTestAddr2}, origin: balRes.origin, u256: balVal},

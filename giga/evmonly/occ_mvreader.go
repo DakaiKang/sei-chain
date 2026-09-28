@@ -44,7 +44,6 @@ type mvVersionedReader struct {
 	// shapeNeeded holds addresses whose existence or emptiness was checked. Such
 	// a read is validated on the account's shape, not on its exact fields.
 	shapeNeeded map[common.Address]struct{}
-	foldBuf     []txVersion
 }
 
 var _ StateReader = (*mvVersionedReader)(nil)
@@ -67,7 +66,6 @@ func (r *mvVersionedReader) reset(mem *mvMemory, txIdx, incarnation int) {
 	clear(r.needed)
 	clear(r.pendingEstimate)
 	clear(r.shapeNeeded)
-	r.foldBuf = r.foldBuf[:0]
 }
 
 func (r *mvVersionedReader) abort(key stateAccessKey, blocking int) {
@@ -132,7 +130,7 @@ func (r *mvVersionedReader) GetBalance(addr common.Address) *big.Int {
 	if rd, ok := r.resolved[key]; ok {
 		return rd.u256.ToBig()
 	}
-	val, res := r.mem.resolveBalance(addr, r.txIdx, r.foldBuf[:0])
+	val, res := r.mem.resolveBalance(addr, r.txIdx)
 	if res.blocking >= 0 {
 		r.onEstimate(key, res.blocking)
 		return new(big.Int)
@@ -142,11 +140,7 @@ func (r *mvVersionedReader) GetBalance(addr common.Address) *big.Int {
 		// by handing it a value uint256FromBig rejects.
 		return new(big.Int).Lsh(big.NewInt(1), 256)
 	}
-	rd := &mvRead{key: key, origin: res.origin, u256: val}
-	if len(res.fold) > 0 {
-		rd.fold = append([]txVersion(nil), res.fold...)
-	}
-	r.resolved[key] = rd
+	r.resolved[key] = &mvRead{key: key, origin: res.origin, u256: val, folded: res.deltas > 0}
 	return val.ToBig()
 }
 

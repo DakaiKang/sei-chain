@@ -236,7 +236,10 @@ type readOrigin struct {
 type mvRead struct {
 	key    stateAccessKey
 	origin readOrigin
-	fold   []txVersion
+	// folded marks a balance read whose value includes commutative deltas. It
+	// is validated by value: the deltas' identities are irrelevant, only their
+	// sum is.
+	folded bool
 	u256   uint256.Int
 	nonce  uint64
 	code   []byte
@@ -249,12 +252,12 @@ type mvRead struct {
 // mvResolution is the outcome of resolving one key at one index.
 type mvResolution struct {
 	origin   readOrigin
-	fold     []txVersion
+	deltas   int // number of commutative deltas folded into a balance
 	blocking int // >= 0 when an estimate was hit
 	overflow bool
 }
 
-func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVersion) (uint256.Int, mvResolution) {
+func (m *mvMemory) resolveBalance(addr common.Address, txIdx int) (uint256.Int, mvResolution) {
 	res := mvResolution{blocking: -1}
 	var credits, debits uint256.Int
 	var base uint256.Int
@@ -267,7 +270,7 @@ func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVe
 			case mvEstimate:
 				res.blocking = int(e.version.txIdx)
 			case mvDelta:
-				foldBuf = append(foldBuf, e.version)
+				res.deltas++
 				acc := &credits
 				if e.neg {
 					acc = &debits
@@ -285,7 +288,6 @@ func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVe
 		}
 		loc.mu.RUnlock()
 	}
-	res.fold = foldBuf
 	if res.blocking >= 0 {
 		return uint256.Int{}, res
 	}
@@ -484,21 +486,10 @@ func originsEqual(a, b readOrigin) bool {
 	return a.kind == b.kind && (a.kind == originSnapshot || a.version == b.version)
 }
 
-func foldsEqual(a, b []txVersion) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // validateReadSet re-resolves every recorded read of a transaction at its
-// index. In version mode a read is valid if it resolves to the same origin
-// and delta fold; in value mode it is valid if it yields the same value. An
+// index. In version mode a read is valid if it resolves to the same origin; in
+// value mode it is valid if it yields the same value. A balance that folded
+// commutative deltas, when read or now, is always validated by value. An
 // estimate in the path always invalidates. The first few stale keys are
 // returned for conflict samples along with the total count.
 func (m *mvMemory) validateReadSet(txIdx int, valueBased bool) (bool, []stateAccessKey, int) {
@@ -508,15 +499,13 @@ func (m *mvMemory) validateReadSet(txIdx int, valueBased bool) (bool, []stateAcc
 	}
 	var stale []stateAccessKey
 	staleCount := 0
-	var foldBuf []txVersion
 	for i := range reads {
 		r := &reads[i]
 		ok := true
 		switch r.key.kind {
 		case stateAccessAccount:
 			// Shape reads are value-based by nature: only zero-ness matters.
-			bal, resB := m.resolveBalance(r.key.address, txIdx, foldBuf[:0])
-			foldBuf = resB.fold
+			bal, resB := m.resolveBalance(r.key.address, txIdx)
 			nonce, resN := m.resolveNonce(r.key.address, txIdx)
 			code, resC := m.resolveCode(r.key.address, txIdx)
 			if resB.blocking >= 0 || resB.overflow || resN.blocking >= 0 || resC.blocking >= 0 {
@@ -525,19 +514,16 @@ func (m *mvMemory) validateReadSet(txIdx int, valueBased bool) (bool, []stateAcc
 			}
 			ok = accountShape{nonceZero: nonce == 0, balanceZero: bal.IsZero(), codeEmpty: len(code) == 0} == r.shape
 		case stateAccessBalance:
-			var val uint256.Int
-			var res mvResolution
-			val, res = m.resolveBalance(r.key.address, txIdx, foldBuf[:0])
-			foldBuf = res.fold
+			val, res := m.resolveBalance(r.key.address, txIdx)
 			switch {
 			case res.blocking >= 0 || res.overflow:
 				ok = false
 			case r.guard:
 				ok = val.Cmp(&r.u256) >= 0
-			case valueBased:
+			case valueBased || r.folded || res.deltas > 0:
 				ok = val.Eq(&r.u256)
 			default:
-				ok = originsEqual(res.origin, r.origin) && foldsEqual(res.fold, r.fold)
+				ok = originsEqual(res.origin, r.origin)
 			}
 		case stateAccessNonce:
 			val, res := m.resolveNonce(r.key.address, txIdx)
