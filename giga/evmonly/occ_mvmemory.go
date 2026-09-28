@@ -578,6 +578,85 @@ func bytesEqualNilSafe(a, b []byte) bool {
 	return true
 }
 
+// materialize folds the balance locations txIdx wrote down to one value entry
+// at txIdx and drops the entries below it. txIdx and every lower transaction
+// must be final: readers above see the same balances through one lookup
+// instead of a fold, and validation of a lower transaction must not run again.
+func (m *mvMemory) materialize(txIdx int) {
+	st := &m.txs[txIdx]
+	st.mu.Lock()
+	keys := st.writeKeys
+	st.mu.Unlock()
+	for _, k := range keys {
+		if k.kind != stateAccessBalance {
+			continue
+		}
+		loc := m.lookup(k)
+		if loc == nil {
+			continue
+		}
+		loc.mu.Lock()
+		m.materializeBalance(loc, k.address, txIdx)
+		loc.mu.Unlock()
+	}
+}
+
+func (m *mvMemory) materializeBalance(loc *mvLocation, addr common.Address, txIdx int) {
+	pos := loc.lowerBound(txIdx+1) - 1
+	if pos < 0 || int(loc.entries[pos].version.txIdx) != txIdx {
+		return
+	}
+	top := &loc.entries[pos]
+	switch top.kind {
+	case mvEstimate:
+		return
+	case mvDelta:
+		var credits, debits, base uint256.Int
+		found := false
+		for i := pos; i >= 0; i-- {
+			e := &loc.entries[i]
+			switch e.kind {
+			case mvEstimate:
+				return
+			case mvDelta:
+				acc := &credits
+				if e.neg {
+					acc = &debits
+				}
+				if _, carry := acc.AddOverflow(acc, &e.u256); carry {
+					return
+				}
+				continue
+			case mvValue:
+				base = e.u256
+				found = true
+			}
+			break
+		}
+		if !found {
+			b, err := uint256FromBig(m.snapshot.GetBalance(addr))
+			if err != nil {
+				return
+			}
+			base = *b
+		}
+		var out uint256.Int
+		if _, carry := out.AddOverflow(&base, &credits); carry || debits.Cmp(&out) > 0 {
+			// Leave an out-of-range fold in place so readers still see the error.
+			return
+		}
+		out.Sub(&out, &debits)
+		top.kind = mvValue
+		top.u256 = out
+		top.neg = false
+	}
+	if pos > 0 {
+		n := copy(loc.entries, loc.entries[pos:])
+		clear(loc.entries[n:])
+		loc.entries = loc.entries[:n]
+	}
+}
+
 // ChangeSetInto consolidates the latest version of every location into the
 // block changeset, using the same emission rules as blockSTMState so both
 // engines produce byte-identical output. Single-threaded; no estimates may

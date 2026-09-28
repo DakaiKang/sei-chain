@@ -355,3 +355,45 @@ func TestMVMemoryReuseAcrossBlocksKeepsLocationsDistinct(t *testing.T) {
 		seen[loc] = i
 	}
 }
+
+// TestMVMemoryMaterializeCommittedDeltas: materialising a committed prefix
+// replaces its deltas with one value, keeps every higher read's balance, and
+// leaves a value-validated read of that balance valid.
+func TestMVMemoryMaterializeCommittedDeltas(t *testing.T) {
+	snap := NewMemoryState()
+	snap.SetBalance(mvTestAddr, big.NewInt(100))
+	m := mvTestMemory(t, 6, snap)
+	for i := range 4 {
+		m.record(i, 0, mvDeltaExec(mvTestAddr, int64(101+i), 1))
+	}
+	m.record(4, 0, mvDeltaExec(mvTestAddr, 105, 1))
+
+	before, res := m.resolveBalance(mvTestAddr, 5)
+	require.Equal(t, uint64(105), before.Uint64())
+	require.Equal(t, 5, res.deltas)
+	read := mvRead{key: stateAccessKey{kind: stateAccessBalance, address: mvTestAddr}, origin: res.origin, folded: true, u256: before}
+	m.record(5, 0, &occTxExecution{reads: []mvRead{read}, writeSet: map[stateAccessKey]struct{}{}})
+
+	for i := range 4 {
+		m.materialize(i)
+	}
+	loc := m.lookup(stateAccessKey{kind: stateAccessBalance, address: mvTestAddr})
+	require.Len(t, loc.entries, 2, "tx0..tx3 collapsed into one value, tx4's delta remains")
+	require.Equal(t, mvValue, loc.entries[0].kind)
+	require.Equal(t, int32(3), loc.entries[0].version.txIdx)
+	require.Equal(t, uint64(104), loc.entries[0].u256.Uint64())
+
+	after, res := m.resolveBalance(mvTestAddr, 5)
+	require.Equal(t, uint64(105), after.Uint64())
+	require.Equal(t, 1, res.deltas)
+	ok, _, _ := m.validateReadSet(5, false)
+	require.True(t, ok, "the folded read compares by value and survives materialisation")
+
+	m.materialize(4)
+	require.Len(t, loc.entries, 1)
+	require.Equal(t, uint64(105), loc.entries[0].u256.Uint64())
+	var cs StateChangeSet
+	m.ChangeSetInto(&cs)
+	require.Len(t, cs.Balances, 1)
+	require.Equal(t, big.NewInt(105), cs.Balances[0].Balance)
+}

@@ -252,6 +252,11 @@ func (r *occBlockSTMRun) validateTask(task occTask) (occTask, error) {
 	if r.hooks.beforeValidate != nil {
 		r.hooks.beforeValidate(task.txIdx, task.incarnation)
 	}
+	if r.sched.isCommitted(task.txIdx) {
+		// Final already; its locations below may have been materialised, so
+		// there is nothing left to check.
+		return r.sched.finishValidation(task.txIdx, task.incarnation, false, task.wave)
+	}
 	r.stats.validationCount.Add(1)
 	ok, stale, staleCount := r.mem.validateReadSet(task.txIdx, r.executor.cfg.OCCValueValidation)
 	aborted := false
@@ -260,7 +265,11 @@ func (r *occBlockSTMRun) validateTask(task occTask) (occTask, error) {
 		r.stats.recordAbort(task.incarnation+1, stale, staleCount)
 		r.mem.convertWritesToEstimates(task.txIdx)
 	}
-	return r.sched.finishValidation(task.txIdx, task.incarnation, aborted)
+	next, err := r.sched.finishValidation(task.txIdx, task.incarnation, aborted, task.wave)
+	if !aborted {
+		r.sched.tryCommit(r.mem.materialize)
+	}
+	return next, err
 }
 
 // finalize walks the transactions in block order, enforcing the block gas

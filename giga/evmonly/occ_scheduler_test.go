@@ -17,8 +17,8 @@ func TestOCCSchedulerSingleWorkerSweep(t *testing.T) {
 	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
 
 	task = s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0}, task, "validation is preferred once it lags execution")
-	task, err := s.finishValidation(0, 0, false)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: task.wave}, task, "validation is preferred once it lags execution")
+	task, err := s.finishValidation(0, 0, false, 0)
 	require.NoError(t, err)
 	require.Equal(t, occTask{}, task)
 
@@ -27,8 +27,8 @@ func TestOCCSchedulerSingleWorkerSweep(t *testing.T) {
 		require.Equal(t, occTask{kind: occTaskExecute, txIdx: idx}, task)
 		require.Equal(t, occTask{}, s.finishExecution(idx, 0, true))
 		task = s.nextTask()
-		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx}, task)
-		task, err = s.finishValidation(idx, 0, false)
+		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx, wave: task.wave}, task)
+		task, err = s.finishValidation(idx, 0, false, task.wave)
 		require.NoError(t, err)
 		require.Equal(t, occTask{}, task)
 	}
@@ -42,26 +42,28 @@ func TestOCCSchedulerValidationAbortReschedulesExecution(t *testing.T) {
 	s := newOCCScheduler(2)
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0}, s.nextTask())
 	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0}, s.nextTask())
-	_, err := s.finishValidation(0, 0, false)
+	task := s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: task.wave}, task)
+	_, err := s.finishValidation(0, 0, false, task.wave)
 	require.NoError(t, err)
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 1}, s.nextTask())
 	require.Equal(t, occTask{}, s.finishExecution(1, 0, true))
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1}, s.nextTask())
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: task.wave}, task)
 
 	require.True(t, s.tryValidationAbort(1, 0))
 	require.False(t, s.tryValidationAbort(1, 0), "only one abort per incarnation")
-	task, err := s.finishValidation(1, 0, true)
+	task, err = s.finishValidation(1, 0, true, 0)
 	require.NoError(t, err)
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 1, incarnation: 1}, task, "execution passed the tx, so the re-execution is handed back")
-	require.Equal(t, int64(2), s.validationIdx.Load())
+	require.Equal(t, 2, s.validationIndex())
 	require.False(t, s.isDone())
 
 	// No new locations: only the transaction itself is re-validated.
 	task = s.finishExecution(1, 1, false)
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, incarnation: 1}, task)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, incarnation: 1, wave: task.wave}, task)
 	require.False(t, s.tryValidationAbort(1, 0), "stale incarnation cannot abort")
-	task, err = s.finishValidation(1, 1, false)
+	task, err = s.finishValidation(1, 1, false, 0)
 	require.NoError(t, err)
 	require.Equal(t, occTask{}, task)
 	require.True(t, s.isDone())
@@ -75,8 +77,9 @@ func TestOCCSchedulerAbortWithNewLocationsRewindsValidation(t *testing.T) {
 		require.Equal(t, occTask{}, s.finishExecution(idx, 0, true))
 	}
 	for idx := range 3 {
-		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx}, s.nextTask())
-		_, err := s.finishValidation(idx, 0, false)
+		task := s.nextTask()
+		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx, wave: task.wave}, task)
+		_, err := s.finishValidation(idx, 0, false, task.wave)
 		require.NoError(t, err)
 	}
 	require.True(t, s.allValidated())
@@ -85,22 +88,22 @@ func TestOCCSchedulerAbortWithNewLocationsRewindsValidation(t *testing.T) {
 	// fails, rewinding validation to 1, and tx0's re-execution with new writes
 	// rewinds it to 0.
 	s.decreaseValidationIdx(0)
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0}, s.nextTask())
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: 1}, s.nextTask(), "the rewind started wave 1")
 	require.True(t, s.tryValidationAbort(0, 0))
 	require.False(t, s.allValidated())
-	task, err := s.finishValidation(0, 0, true)
+	task, err := s.finishValidation(0, 0, true, 0)
 	require.NoError(t, err)
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0, incarnation: 1}, task)
-	require.Equal(t, int64(1), s.validationIdx.Load())
+	require.Equal(t, 1, s.validationIndex())
 	require.Equal(t, occTask{}, s.finishExecution(0, 1, true))
-	require.Equal(t, int64(0), s.validationIdx.Load())
+	require.Equal(t, 0, s.validationIndex())
 	require.False(t, s.isDone())
 
 	for idx := range 3 {
 		task = s.nextTask()
 		require.Equal(t, occTaskValidate, task.kind)
 		require.Equal(t, idx, task.txIdx)
-		_, err := s.finishValidation(task.txIdx, task.incarnation, false)
+		_, err := s.finishValidation(task.txIdx, task.incarnation, false, task.wave)
 		require.NoError(t, err)
 	}
 	require.True(t, s.isDone())
@@ -126,16 +129,19 @@ func TestOCCSchedulerDependencies(t *testing.T) {
 	require.Equal(t, occTxExecuting, s.txs[1].status)
 	require.Equal(t, occTask{}, s.finishExecution(1, 0, false))
 
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0}, s.nextTask())
-	_, err := s.finishValidation(0, 0, false)
+	task := s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: task.wave}, task)
+	_, err := s.finishValidation(0, 0, false, task.wave)
 	require.NoError(t, err)
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1}, s.nextTask())
-	_, err = s.finishValidation(1, 0, false)
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: task.wave}, task)
+	_, err = s.finishValidation(1, 0, false, task.wave)
 	require.NoError(t, err)
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 2}, s.nextTask())
 	require.Equal(t, occTask{}, s.finishExecution(2, 0, true))
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 2}, s.nextTask())
-	_, err = s.finishValidation(2, 0, false)
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 2, wave: task.wave}, task)
+	_, err = s.finishValidation(2, 0, false, task.wave)
 	require.NoError(t, err)
 	require.True(t, s.isDone())
 	require.True(t, s.allValidated())
@@ -149,13 +155,13 @@ func TestOCCSchedulerIncarnationCap(t *testing.T) {
 	task := s.nextTask()
 	require.Equal(t, occTaskValidate, task.kind)
 	require.True(t, s.tryValidationAbort(0, occMaxTxIncarnations-2))
-	task, err := s.finishValidation(0, occMaxTxIncarnations-2, true)
+	task, err := s.finishValidation(0, occMaxTxIncarnations-2, true, 0)
 	require.NoError(t, err)
 	require.Equal(t, occMaxTxIncarnations-1, task.incarnation)
 	require.Equal(t, occTask{}, s.finishExecution(0, occMaxTxIncarnations-1, true))
 	task = s.nextTask()
 	require.True(t, s.tryValidationAbort(0, occMaxTxIncarnations-1))
-	_, err = s.finishValidation(0, occMaxTxIncarnations-1, true)
+	_, err = s.finishValidation(0, occMaxTxIncarnations-1, true, 0)
 	require.ErrorIs(t, err, errOCCMaxIncarnation)
 }
 
@@ -197,7 +203,7 @@ func TestOCCSchedulerConcurrentTermination(t *testing.T) {
 					case occTaskValidate:
 						aborted := fails(task.txIdx, task.incarnation) && s.tryValidationAbort(task.txIdx, task.incarnation)
 						var err error
-						task, err = s.finishValidation(task.txIdx, task.incarnation, aborted)
+						task, err = s.finishValidation(task.txIdx, task.incarnation, aborted, task.wave)
 						require.NoError(t, err)
 					}
 				}
@@ -210,4 +216,47 @@ func TestOCCSchedulerConcurrentTermination(t *testing.T) {
 			require.Equal(t, occTxValidated, s.txs[i].status, "tx %d", i)
 		}
 	}
+}
+
+// TestOCCSchedulerCommitCursorWaves: a transaction validated before a lower
+// transaction rewound validation is not final until it is validated again in
+// the newer wave.
+func TestOCCSchedulerCommitCursorWaves(t *testing.T) {
+	s := newOCCScheduler(2)
+	var committed []int
+	commit := func(idx int) { committed = append(committed, idx) }
+
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0}, s.nextTask())
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 1}, s.nextTask())
+	// tx1 finishes first. The validation index has not passed 1, so no wave
+	// starts; the sweep skips the executing tx0 and validates tx1 in wave 0.
+	require.Equal(t, occTask{}, s.finishExecution(1, 0, true))
+	task := s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 0}, task)
+	_, err := s.finishValidation(1, 0, false, task.wave)
+	require.NoError(t, err)
+	s.tryCommit(commit)
+	require.Empty(t, committed, "tx0 is not validated yet")
+
+	// tx0 finishes and rewinds validation from 2 to 0, starting wave 1. tx1's
+	// wave-0 validation predates tx0's writes and is stale.
+	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: 1}, task)
+	_, err = s.finishValidation(0, 0, false, task.wave)
+	require.NoError(t, err)
+	s.tryCommit(commit)
+	require.Equal(t, []int{0}, committed, "tx0 is final; tx1 must be re-validated in wave 1")
+	require.True(t, s.isCommitted(0))
+	require.False(t, s.isCommitted(1))
+
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 1}, task)
+	_, err = s.finishValidation(1, 0, false, task.wave)
+	require.NoError(t, err)
+	s.tryCommit(commit)
+	require.Equal(t, []int{0, 1}, committed)
+	require.False(t, s.tryValidationAbort(1, 0), "a committed transaction cannot be aborted")
+	require.True(t, s.isDone())
+	require.True(t, s.allValidated())
 }
