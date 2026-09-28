@@ -121,7 +121,11 @@ type OCCStats struct {
 	MaxIncarnation  uint64
 	ConflictCount   uint64
 	ValidationCount uint64
-	ConflictSamples []OCCConflictCount
+	// DependencyAbortCount counts executions abandoned because they read a
+	// location a lower transaction was about to rewrite (Block-STM only). Such
+	// aborts do not consume an incarnation and are not reruns.
+	DependencyAbortCount uint64
+	ConflictSamples      []OCCConflictCount
 }
 
 // OCCConflictCount aggregates conflicts observed while validating optimistic

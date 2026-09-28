@@ -900,7 +900,13 @@ func TestExecutorOCCDeterministicAcrossRuns(t *testing.T) {
 		require.Equal(t, baseline.Txs, result.Txs)
 		require.Equal(t, baseline.Receipts, result.Receipts)
 		require.Equal(t, baseline.ChangeSet, result.ChangeSet)
-		require.Equal(t, baseline.OCCStats, result.OCCStats)
+		// ValidationCount depends on worker interleaving even without conflicts
+		// (a first incarnation that writes new locations re-validates its
+		// successors), so it is excluded from the determinism check.
+		baselineStats, resultStats := baseline.OCCStats, result.OCCStats
+		baselineStats.ValidationCount, resultStats.ValidationCount = 0, 0
+		require.Equal(t, baselineStats, resultStats)
+		require.GreaterOrEqual(t, result.OCCStats.ValidationCount, uint64(txCount))
 		for i := range txCount {
 			require.Equal(t, baselineState.GetBalance(senders[i]), state.GetBalance(senders[i]))
 			require.Equal(t, baselineState.GetBalance(recipients[i]), state.GetBalance(recipients[i]))

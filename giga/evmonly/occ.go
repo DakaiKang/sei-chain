@@ -22,6 +22,7 @@ type occTxExecution struct {
 	receipt                  *ethtypes.Receipt
 	changeSet                StateChangeSet
 	readSet                  map[stateAccessKey]struct{}
+	reads                    []mvRead // Block-STM: resolved reads with origins
 	writeSet                 map[stateAccessKey]struct{}
 	gasUsed                  uint64
 	gasLimit                 uint64
@@ -65,12 +66,6 @@ func (e *Executor) executeBlockOCC(ctx context.Context, req PreparedBlock, sourc
 	default:
 		return e.executeBlockBlockSTM(ctx, req, source)
 	}
-}
-
-// executeBlockBlockSTM runs the Block-STM engine. Until the engine lands it
-// delegates to the snapshot engine so the mode switch is wired end to end.
-func (e *Executor) executeBlockBlockSTM(ctx context.Context, req PreparedBlock, source StateReader) (*BlockResult, error) {
-	return e.executeBlockOCCSnapshot(ctx, req, source)
 }
 
 // executeBlockOCCSnapshot executes every transaction against the block
@@ -449,12 +444,13 @@ type occExecutionTask struct {
 }
 
 type occValidationResult struct {
-	fallbackReason  string
-	rerunCount      uint64
-	maxIncarnation  uint64
-	conflictCount   uint64
-	validationCount uint64
-	conflicts       map[occConflictAggregationKey]uint64
+	fallbackReason   string
+	rerunCount       uint64
+	maxIncarnation   uint64
+	conflictCount    uint64
+	validationCount  uint64
+	dependencyAborts uint64
+	conflicts        map[occConflictAggregationKey]uint64
 }
 
 type occConflictAggregationKey struct {
@@ -525,12 +521,13 @@ func (r *occValidationResult) addConflicts(access string, writes *stateAccessInd
 
 func (r occValidationResult) stats(fallback bool) OCCStats {
 	stats := OCCStats{
-		Attempted:       true,
-		Fallback:        fallback,
-		RerunCount:      r.rerunCount,
-		MaxIncarnation:  r.maxIncarnation,
-		ConflictCount:   r.conflictCount,
-		ValidationCount: r.validationCount,
+		Attempted:            true,
+		Fallback:             fallback,
+		RerunCount:           r.rerunCount,
+		MaxIncarnation:       r.maxIncarnation,
+		ConflictCount:        r.conflictCount,
+		ValidationCount:      r.validationCount,
+		DependencyAbortCount: r.dependencyAborts,
 	}
 	if fallback {
 		stats.FallbackReason = r.fallbackReason
@@ -579,6 +576,8 @@ func (k stateAccessKind) String() string {
 		return "code"
 	case stateAccessStorage:
 		return "storage"
+	case stateAccessStorageClear:
+		return "storage_clear"
 	default:
 		return "unknown"
 	}

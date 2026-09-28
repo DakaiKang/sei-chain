@@ -795,7 +795,9 @@ func TestExecutorOCCRerunsWhenLaterTxReadsFeeCreditedCoinbase(t *testing.T) {
 	req := BlockRequest{Context: blockContext(chainID), Txs: [][]byte{feeTx, readCoinbaseTx}}
 	seqResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0)}, withTestState(seqState)).ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
-	occResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState)).ExecuteBlock(t.Context(), req)
+	occExecutor := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState))
+	occExecutor.occHooks = holdFirstTxWritesUntilLastTxExecuted(len(req.Txs))
+	occResult, err := occExecutor.ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
 
 	require.True(t, occResult.OCCStats.Attempted)
@@ -842,19 +844,23 @@ func TestExecutorOCCRerunsWhenLaterTxWritesFeeCreditedCoinbase(t *testing.T) {
 
 	seqResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0)}, withTestState(seqState)).ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
-	occResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState)).ExecuteBlock(t.Context(), req)
+	occExecutor := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState))
+	occExecutor.occHooks = holdFirstTxWritesUntilLastTxExecuted(len(req.Txs))
+	occResult, err := occExecutor.ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
 
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
 	require.Equal(t, uint64(1), occResult.OCCStats.RerunCount)
-	foundCoinbaseBalanceWrite := false
+	// Crediting the coinbase reads its balance first, so under Block-STM the
+	// conflict is a stale read of the fee-credited balance.
+	foundCoinbaseBalanceRead := false
 	for _, conflict := range occResult.OCCStats.ConflictSamples {
-		if conflict.Access == "write" && conflict.Kind == "balance" && conflict.Address == coinbase {
-			foundCoinbaseBalanceWrite = true
+		if conflict.Access == "read" && conflict.Kind == "balance" && conflict.Address == coinbase {
+			foundCoinbaseBalanceRead = true
 		}
 	}
-	require.True(t, foundCoinbaseBalanceWrite)
+	require.True(t, foundCoinbaseBalanceRead)
 
 	seqState.ApplyChangeSet(seqResult.ChangeSet)
 	occState.ApplyChangeSet(occResult.ChangeSet)
@@ -887,12 +893,14 @@ func TestExecutorOCCRerunsCoinbaseSpendFundedByPriorFeeCredit(t *testing.T) {
 
 	seqResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0)}, withTestState(seqState)).ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
-	occResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState)).ExecuteBlock(t.Context(), req)
+	occExecutor := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState))
+	occExecutor.occHooks = holdFirstTxWritesUntilLastTxExecuted(len(req.Txs))
+	occResult, err := occExecutor.ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
 
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
-	require.Equal(t, uint64(1), occResult.OCCStats.RerunCount)
+	require.GreaterOrEqual(t, occResult.OCCStats.RerunCount+occResult.OCCStats.DependencyAbortCount, uint64(1))
 
 	seqState.ApplyChangeSet(seqResult.ChangeSet)
 	occState.ApplyChangeSet(occResult.ChangeSet)
@@ -930,12 +938,14 @@ func TestExecutorOCCRerunsCoinbaseReadAfterNormalAndCommutativeWrite(t *testing.
 
 	seqResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0)}, withTestState(seqState)).ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
-	occResult, err := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState)).ExecuteBlock(t.Context(), req)
+	occExecutor := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 2}, withTestState(occState))
+	occExecutor.occHooks = holdFirstTxWritesUntilLastTxExecuted(len(req.Txs))
+	occResult, err := occExecutor.ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
 
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
-	require.Equal(t, uint64(1), occResult.OCCStats.RerunCount)
+	require.GreaterOrEqual(t, occResult.OCCStats.RerunCount+occResult.OCCStats.DependencyAbortCount, uint64(1))
 
 	seqState.ApplyChangeSet(seqResult.ChangeSet)
 	occState.ApplyChangeSet(occResult.ChangeSet)
@@ -1050,7 +1060,10 @@ func TestExecutorOCCRerunsSameSenderNonceChain(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
-	require.Equal(t, uint64(1), result.OCCStats.RerunCount)
+	// The second transaction either reads a stale nonce and reruns, or parks on
+	// the first as a dependency; either way it is not executed for free.
+	require.LessOrEqual(t, result.OCCStats.RerunCount, uint64(1))
+	require.GreaterOrEqual(t, result.OCCStats.RerunCount+result.OCCStats.DependencyAbortCount, uint64(1))
 
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, uint64(2), state.GetNonce(sender))
@@ -1137,12 +1150,14 @@ func TestExecutorOCCCreateThenCallRerunsDependentTx(t *testing.T) {
 
 	seqResult, err := NewExecutor(Config{}, withTestState(seqState)).ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
-	occResult, err := NewExecutor(Config{OCCWorkers: 2}, withTestState(occState)).ExecuteBlock(t.Context(), req)
+	occExecutor := NewExecutor(Config{OCCWorkers: 2}, withTestState(occState))
+	occExecutor.occHooks = holdFirstTxWritesUntilLastTxExecuted(len(req.Txs))
+	occResult, err := occExecutor.ExecuteBlock(t.Context(), req)
 	require.NoError(t, err)
 
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
-	require.GreaterOrEqual(t, occResult.OCCStats.RerunCount, uint64(1))
+	require.GreaterOrEqual(t, occResult.OCCStats.RerunCount+occResult.OCCStats.DependencyAbortCount, uint64(1))
 	require.Equal(t, seqResult.GasUsed, occResult.GasUsed)
 
 	seqState.ApplyChangeSet(seqResult.ChangeSet)
@@ -2391,8 +2406,9 @@ func TestExecutorOCCHotRecipientChainDoesNotExhaustIncarnations(t *testing.T) {
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
 	require.Empty(t, result.OCCStats.FallbackReason)
-	require.Equal(t, uint64(txCount-1), result.OCCStats.RerunCount)
-	require.Equal(t, uint64(2*txCount-1), result.OCCStats.ValidationCount)
+	require.GreaterOrEqual(t, result.OCCStats.RerunCount, uint64(1))
+	require.Less(t, result.OCCStats.MaxIncarnation, uint64(occMaxTxIncarnations))
+	require.GreaterOrEqual(t, result.OCCStats.ValidationCount, uint64(txCount)+result.OCCStats.RerunCount)
 
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, big.NewInt(int64(txCount)), state.GetBalance(recipient))
@@ -2433,8 +2449,9 @@ func TestExecutorOCCSameSenderChainDoesNotExhaustIncarnations(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
-	require.Equal(t, uint64(txCount-1), result.OCCStats.RerunCount)
-	require.Equal(t, uint64(2*txCount-1), result.OCCStats.ValidationCount)
+	require.Less(t, result.OCCStats.MaxIncarnation, uint64(occMaxTxIncarnations))
+	require.GreaterOrEqual(t, result.OCCStats.RerunCount+result.OCCStats.DependencyAbortCount, uint64(1))
+	require.GreaterOrEqual(t, result.OCCStats.ValidationCount, uint64(txCount)+result.OCCStats.RerunCount)
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, uint64(txCount), state.GetNonce(sender))
 }

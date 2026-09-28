@@ -24,7 +24,8 @@ var (
 )
 
 type nativeStateDB struct {
-	source StateReader
+	source       StateReader
+	readObserver readObserver
 
 	accounts map[common.Address]*nativeAccount
 	base     map[common.Address]*nativeAccount
@@ -118,7 +119,19 @@ const (
 	stateAccessNonce
 	stateAccessCode
 	stateAccessStorage
+	// stateAccessStorageClear is a per-address event: the account's storage was
+	// cleared (SetStorage or self-destruct). It is only stored in multi-version
+	// memory; nativeStateDB never marks it directly.
+	stateAccessStorageClear
 )
+
+// readObserver is notified of every semantic state access nativeStateDB
+// performs. The Block-STM versioned reader implements it to learn which
+// resolved keys a transaction depends on and to abort on estimate reads.
+type readObserver interface {
+	observeRead(stateAccessKey)
+	observeWrite(stateAccessKey)
+}
 
 type stateAccessKey struct {
 	kind    stateAccessKind
@@ -137,6 +150,7 @@ func newNativeStateDB(source StateReader) *nativeStateDB {
 
 func (s *nativeStateDB) reset(source StateReader) {
 	s.source = source
+	s.readObserver, _ = source.(readObserver)
 	clearAccountMap(&s.accounts)
 	clearAccountMap(&s.base)
 	s.refund = 0
@@ -756,11 +770,17 @@ func (s *nativeStateDB) markRead(key stateAccessKey) {
 	if s.readSet != nil {
 		s.readSet[key] = struct{}{}
 	}
+	if s.readObserver != nil {
+		s.readObserver.observeRead(key)
+	}
 }
 
 func (s *nativeStateDB) markWrite(key stateAccessKey) {
 	if s.writeSet != nil {
 		s.writeSet[key] = struct{}{}
+	}
+	if s.readObserver != nil {
+		s.readObserver.observeWrite(key)
 	}
 }
 

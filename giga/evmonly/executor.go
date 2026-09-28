@@ -26,6 +26,9 @@ type Executor struct {
 	occPool          *occWorkerPool
 	resultPool       *blockResultPool
 	stateDBPool      sync.Pool
+	mvMemoryPool     sync.Pool
+	mvReaderPool     sync.Pool
+	occHooks         occBlockSTMHooks
 	storeMu          sync.Mutex
 	stateStore       gigatypes.StateDB
 	receiptStore     receipt.ReceiptStore
