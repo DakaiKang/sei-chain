@@ -969,3 +969,22 @@ func BenchmarkExecuteTransferBlock(b *testing.B) {
 		})
 	}
 }
+
+func TestOCCModeFlag(t *testing.T) {
+	cfg, err := parseConfig([]string{"--blocks=1"})
+	require.NoError(t, err)
+	require.Equal(t, evmonly.OCCModeBlockSTM, cfg.occMode)
+	require.Equal(t, evmonly.OCCModeBlockSTM, executorConfig(cfg).OCCMode)
+
+	cfg, err = parseConfig([]string{"--blocks=1", "--occ-mode=snapshot"})
+	require.NoError(t, err)
+	require.Equal(t, evmonly.OCCModeSnapshot, cfg.occMode)
+	require.Equal(t, evmonly.OCCModeSnapshot, executorConfig(cfg).OCCMode)
+
+	cfg, err = parseConfig([]string{"--blocks=1", "--occ-mode= BlockSTM "})
+	require.NoError(t, err)
+	require.Equal(t, evmonly.OCCModeBlockSTM, cfg.occMode)
+
+	_, err = parseConfig([]string{"--blocks=1", "--occ-mode=turbo"})
+	require.ErrorContains(t, err, "unsupported occ mode")
+}

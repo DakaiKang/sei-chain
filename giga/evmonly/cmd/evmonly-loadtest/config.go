@@ -53,6 +53,7 @@ type config struct {
 	parseWorkers           int
 	workers                int
 	executorWorkers        int
+	occMode                evmonly.OCCMode
 	reportInterval         time.Duration
 	metricsAddr            string
 	resultSink             string
@@ -138,6 +139,7 @@ func parseConfig(args []string) (config, error) {
 	fs.IntVar(&cfg.parseWorkers, "parse-workers", 0, "parallel transaction decode/sender recovery workers inside each prepared block; 0 defaults to 1 when prepare-workers > 1, otherwise GOMAXPROCS")
 	fs.IntVar(&cfg.workers, "workers", defaultWorkerCount, "ordered block executor workers; must be 1 for giga store commits")
 	fs.IntVar(&cfg.executorWorkers, "executor-workers", defaultExecutorWorkers(), "parallel OCC workers inside each executor")
+	occMode := fs.String("occ-mode", string(evmonly.OCCModeBlockSTM), "parallel engine inside each executor: blockstm or snapshot")
 	fs.DurationVar(&cfg.reportInterval, "report-interval", defaultReportInterval, "stdout and rate-gauge reporting interval; 0 disables periodic reports")
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", defaultMetricsAddr, "Prometheus listen address; empty disables HTTP metrics")
 	fs.StringVar(&cfg.resultSink, "result-sink", resultSinkDiscard, "result sink mode: discard or file")
@@ -159,6 +161,9 @@ func parseConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	var err error
+	if cfg.occMode, err = evmonly.ParseOCCMode(strings.ToLower(strings.TrimSpace(*occMode))); err != nil {
+		return config{}, err
+	}
 	if cfg.chainID, err = parsePositiveBig("chain-id", *chainID); err != nil {
 		return config{}, err
 	}
@@ -347,6 +352,7 @@ func executorConfig(cfg config) evmonly.Config {
 		MinGasPrice:          new(big.Int).Set(cfg.minGasPrice),
 		DisableGasPriceCheck: cfg.disableGasPriceRule,
 		OCCWorkers:           cfg.executorWorkers,
+		OCCMode:              cfg.occMode,
 		ParseWorkers:         cfg.parseWorkers,
 		BlockResultPoolSize:  cfg.resultPoolSize,
 	}

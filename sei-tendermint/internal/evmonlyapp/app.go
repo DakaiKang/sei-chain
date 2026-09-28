@@ -145,6 +145,7 @@ func (a *evmOnlyApplication) InitChain(req *abci.RequestInitChain) (*abci.Respon
 			ChainConfig:         a.chainConfig,
 			MinGasPrice:         big.NewInt(evmOnlyMinGasPrice),
 			OCCWorkers:          runtime.GOMAXPROCS(0),
+			OCCMode:             evmonly.OCCModeBlockSTM,
 			ParseWorkers:        runtime.GOMAXPROCS(0),
 			BlockResultPoolSize: 1,
 		},

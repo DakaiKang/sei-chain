@@ -153,6 +153,10 @@ Useful knobs:
   block reads the snapshot produced by the previous `CommitStateChanges` call.
 - `--executor-workers`: parallel OCC workers inside each executor. The default
   is `min(12, GOMAXPROCS)`, following the `sei-v3` OCC worker default.
+- `--occ-mode`: parallel engine inside each executor, either `blockstm`
+  (collaborative scheduler over multi-version memory, the default) or `snapshot`
+  (every transaction runs against the block snapshot, then validation and reruns
+  proceed in index order).
 - `--prepare-workers`: parallel stateless preparation workers used for
   transaction RLP decode and sender recovery. The default is `GOMAXPROCS`.
 - `--parse-workers`: parallel transaction decode/sender recovery workers inside

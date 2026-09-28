@@ -57,7 +57,25 @@ func newOCCSpeculativeRunner(e *Executor, req PreparedBlock) occSpeculativeRunne
 	}
 }
 
+// executeBlockOCC dispatches to the configured parallel engine.
 func (e *Executor) executeBlockOCC(ctx context.Context, req PreparedBlock, source StateReader) (*BlockResult, error) {
+	switch e.cfg.OCCMode {
+	case OCCModeSnapshot:
+		return e.executeBlockOCCSnapshot(ctx, req, source)
+	default:
+		return e.executeBlockBlockSTM(ctx, req, source)
+	}
+}
+
+// executeBlockBlockSTM runs the Block-STM engine. Until the engine lands it
+// delegates to the snapshot engine so the mode switch is wired end to end.
+func (e *Executor) executeBlockBlockSTM(ctx context.Context, req PreparedBlock, source StateReader) (*BlockResult, error) {
+	return e.executeBlockOCCSnapshot(ctx, req, source)
+}
+
+// executeBlockOCCSnapshot executes every transaction against the block
+// snapshot in parallel, then validates and reruns conflicts in index order.
+func (e *Executor) executeBlockOCCSnapshot(ctx context.Context, req PreparedBlock, source StateReader) (*BlockResult, error) {
 	runner := newOCCSpeculativeRunner(e, req)
 	workers := min(e.cfg.OCCWorkers, len(req.Txs))
 	executionPool := e.occPool
@@ -566,7 +584,12 @@ func (k stateAccessKind) String() string {
 	}
 }
 
-func (e *Executor) mergeOCCResults(ctx context.Context, results []occTxExecution, finalState *blockSTMState) (*BlockResult, error) {
+// occChangeSetSource produces the block's consolidated state changes.
+type occChangeSetSource interface {
+	ChangeSetInto(*StateChangeSet)
+}
+
+func (e *Executor) mergeOCCResults(ctx context.Context, results []occTxExecution, finalState occChangeSetSource) (*BlockResult, error) {
 	blockResult, err := e.acquireBlockResult(ctx, len(results))
 	if err != nil {
 		return nil, err
