@@ -45,6 +45,7 @@ type nativeStateDB struct {
 	snapshots                []nativeSnapshot
 	readSet                  map[stateAccessKey]struct{}
 	writeSet                 map[stateAccessKey]struct{}
+	shapeReads               map[common.Address]accountShape
 	lastReadSetSize          int
 	lastWriteSetSize         int
 
@@ -125,6 +126,29 @@ const (
 	stateAccessStorageClear
 )
 
+// accountShape is what existence and emptiness checks depend on: whether the
+// nonce, balance and code are zero. An account read is validated on its shape,
+// not on the exact values, so commutative balance credits that keep a balance
+// non-zero do not invalidate it.
+type accountShape struct {
+	nonceZero   bool
+	balanceZero bool
+	codeEmpty   bool
+}
+
+// accountShapeOf derives the shape of an account from a state reader.
+func accountShapeOf(r StateReader, addr common.Address) accountShape {
+	return accountShape{
+		nonceZero:   r.GetNonce(addr) == 0,
+		balanceZero: r.GetBalance(addr).Sign() == 0,
+		codeEmpty:   len(r.GetCode(addr)) == 0,
+	}
+}
+
+func (a *nativeAccount) shape() accountShape {
+	return accountShape{nonceZero: a.Nonce == 0, balanceZero: a.Balance.IsZero(), codeEmpty: len(a.Code) == 0}
+}
+
 // readObserver is notified of every semantic state access nativeStateDB
 // performs. The Block-STM versioned reader implements it to learn which
 // resolved keys a transaction depends on and to abort on estimate reads.
@@ -188,6 +212,9 @@ func (s *nativeStateDB) reset(source StateReader) {
 	}
 	if s.writeSet != nil {
 		clear(s.writeSet)
+	}
+	if s.shapeReads != nil {
+		clear(s.shapeReads)
 	}
 	s.txHash = common.Hash{}
 	s.txIndex = 0
@@ -301,19 +328,13 @@ func (s *nativeStateDB) SubBalance(addr common.Address, amount *uint256.Int, _ t
 	return prev
 }
 
-func (s *nativeStateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
-	if reason == tracing.BalanceIncreaseRewardTransactionFee {
-		return s.addCommutativeBalance(addr, amount)
-	}
-	prev := *s.GetBalance(addr)
-	if amount == nil || amount.IsZero() {
-		return prev
-	}
-	acct := s.account(addr)
-	s.recordAccount(addr)
-	s.markWrite(stateAccessKey{kind: stateAccessBalance, address: addr})
-	acct.Balance.Add(acct.Balance, amount)
-	return prev
+// AddBalance credits an account. A credit's result does not depend on the
+// balance it lands on, so it is recorded as a commutative delta rather than a
+// read followed by a write: transactions that only credit the same address do
+// not conflict with each other. Any read of the balance in this transaction is
+// tracked by GetBalance and validated as usual.
+func (s *nativeStateDB) AddBalance(addr common.Address, amount *uint256.Int, _ tracing.BalanceChangeReason) uint256.Int {
+	return s.addCommutativeBalance(addr, amount)
 }
 
 func (s *nativeStateDB) addCommutativeBalance(addr common.Address, amount *uint256.Int) uint256.Int {
@@ -385,8 +406,8 @@ func (s *nativeStateDB) GetCodeHash(addr common.Address) common.Hash {
 		}
 		return acct.CodeHash
 	}
-	s.markRead(stateAccessKey{kind: stateAccessBalance, address: addr})
-	s.markRead(stateAccessKey{kind: stateAccessNonce, address: addr})
+	// A codeless account's hash depends only on whether it exists.
+	s.markRead(stateAccessKey{kind: stateAccessAccount, address: addr})
 	if acct.Nonce == 0 && acct.Balance.IsZero() {
 		return common.Hash{}
 	}
@@ -755,20 +776,31 @@ func (s *nativeStateDB) enableAccessTracking() {
 	} else {
 		clear(s.writeSet)
 	}
+	if s.shapeReads == nil {
+		s.shapeReads = map[common.Address]accountShape{}
+	} else {
+		clear(s.shapeReads)
+	}
 }
 
-// takeAccessSets hands the read and write sets to the caller and stops tracking;
-// enableAccessTracking must be called again before further accesses are recorded.
-func (s *nativeStateDB) takeAccessSets() (map[stateAccessKey]struct{}, map[stateAccessKey]struct{}) {
-	readSet, writeSet := s.readSet, s.writeSet
+// takeAccessSets hands the read set, write set and the shapes observed by
+// account reads to the caller and stops tracking; enableAccessTracking must be
+// called again before further accesses are recorded.
+func (s *nativeStateDB) takeAccessSets() (map[stateAccessKey]struct{}, map[stateAccessKey]struct{}, map[common.Address]accountShape) {
+	readSet, writeSet, shapes := s.readSet, s.writeSet, s.shapeReads
 	s.lastReadSetSize, s.lastWriteSetSize = len(readSet), len(writeSet)
-	s.readSet, s.writeSet = nil, nil
-	return readSet, writeSet
+	s.readSet, s.writeSet, s.shapeReads = nil, nil, nil
+	return readSet, writeSet, shapes
 }
 
 func (s *nativeStateDB) markRead(key stateAccessKey) {
 	if s.readSet != nil {
 		s.readSet[key] = struct{}{}
+		if key.kind == stateAccessAccount {
+			// The shape the transaction started from; its own later writes are a
+			// deterministic function of it.
+			s.shapeReads[key.address] = s.baseAccount(key.address).shape()
+		}
 	}
 	if s.readObserver != nil {
 		s.readObserver.observeRead(key)

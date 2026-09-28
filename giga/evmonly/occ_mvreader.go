@@ -40,7 +40,10 @@ type mvVersionedReader struct {
 	// pendingEstimate holds keys that resolved to an estimate before the
 	// transaction needed them. Needing one of them aborts.
 	pendingEstimate map[stateAccessKey]int
-	foldBuf         []txVersion
+	// shapeNeeded holds addresses whose existence or emptiness was checked. Such
+	// a read is validated on the account's shape, not on its exact fields.
+	shapeNeeded map[common.Address]struct{}
+	foldBuf     []txVersion
 }
 
 var _ StateReader = (*mvVersionedReader)(nil)
@@ -51,6 +54,7 @@ func newMVVersionedReader() *mvVersionedReader {
 		resolved:        map[stateAccessKey]*mvRead{},
 		needed:          map[stateAccessKey]struct{}{},
 		pendingEstimate: map[stateAccessKey]int{},
+		shapeNeeded:     map[common.Address]struct{}{},
 	}
 }
 
@@ -61,6 +65,7 @@ func (r *mvVersionedReader) reset(mem *mvMemory, txIdx, incarnation int) {
 	clear(r.resolved)
 	clear(r.needed)
 	clear(r.pendingEstimate)
+	clear(r.shapeNeeded)
 	r.foldBuf = r.foldBuf[:0]
 }
 
@@ -85,12 +90,24 @@ func (r *mvVersionedReader) observeWrite(key stateAccessKey) {
 	r.observe(key)
 }
 
+func accountShapeKeys(addr common.Address) [3]stateAccessKey {
+	return [3]stateAccessKey{
+		{kind: stateAccessBalance, address: addr},
+		{kind: stateAccessNonce, address: addr},
+		{kind: stateAccessCode, address: addr},
+	}
+}
+
 func (r *mvVersionedReader) observe(key stateAccessKey) {
 	if key.kind == stateAccessAccount {
-		// Existence and emptiness are derived from balance, nonce and code.
-		r.need(stateAccessKey{kind: stateAccessBalance, address: key.address})
-		r.need(stateAccessKey{kind: stateAccessNonce, address: key.address})
-		r.need(stateAccessKey{kind: stateAccessCode, address: key.address})
+		// Existence and emptiness are derived from balance, nonce and code, but
+		// only through whether each is zero: the read is validated on that shape.
+		r.shapeNeeded[key.address] = struct{}{}
+		for _, k := range accountShapeKeys(key.address) {
+			if blocking, ok := r.pendingEstimate[k]; ok {
+				r.abort(k, blocking)
+			}
+		}
 		return
 	}
 	r.need(key)
@@ -101,6 +118,9 @@ func (r *mvVersionedReader) observe(key stateAccessKey) {
 // return a placeholder that can never reach the output unneeded.
 func (r *mvVersionedReader) onEstimate(key stateAccessKey, blocking int) {
 	if _, needed := r.needed[key]; needed {
+		r.abort(key, blocking)
+	}
+	if _, shaped := r.shapeNeeded[key.address]; shaped && key.kind != stateAccessStorage {
 		r.abort(key, blocking)
 	}
 	r.pendingEstimate[key] = blocking
@@ -176,10 +196,32 @@ func (r *mvVersionedReader) GetState(addr common.Address, slot common.Hash) comm
 // collect returns the reads validation must check: every key the transaction
 // needed that was resolved from multi-version memory or the snapshot.
 func (r *mvVersionedReader) collect() []mvRead {
-	reads := make([]mvRead, 0, len(r.needed))
+	reads := make([]mvRead, 0, len(r.needed)+len(r.shapeNeeded))
 	for key := range r.needed {
 		if rd, ok := r.resolved[key]; ok {
 			reads = append(reads, *rd)
+		}
+	}
+	for addr := range r.shapeNeeded {
+		keys := accountShapeKeys(addr)
+		bal, okB := r.resolved[keys[0]]
+		nonce, okN := r.resolved[keys[1]]
+		code, okC := r.resolved[keys[2]]
+		if okB && okN && okC {
+			reads = append(reads, mvRead{
+				key:   stateAccessKey{kind: stateAccessAccount, address: addr},
+				shape: accountShape{nonceZero: nonce.nonce == 0, balanceZero: bal.u256.IsZero(), codeEmpty: len(code.code) == 0},
+			})
+			continue
+		}
+		// The account was never loaded from source (fully written before being
+		// read): fall back to exact reads of whatever was resolved.
+		for _, k := range keys {
+			if rd, ok := r.resolved[k]; ok {
+				if _, dup := r.needed[k]; !dup {
+					reads = append(reads, *rd)
+				}
+			}
 		}
 	}
 	return reads
@@ -269,7 +311,7 @@ func (e *Executor) executeIncarnation(
 		txIdxUint,
 		baseFee,
 	)
-	_, writeSet := stateDB.takeAccessSets()
+	_, writeSet, _ := stateDB.takeAccessSets()
 	result = occTxExecution{
 		txResult:                 txResult,
 		receipt:                  receipt,

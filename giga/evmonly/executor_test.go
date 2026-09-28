@@ -685,13 +685,18 @@ func TestExecutorOCCNonConflictingTransfersMatchSequential(t *testing.T) {
 	}
 }
 
-func TestExecutorOCCConflictingTransfersMatchSequential(t *testing.T) {
+// TestExecutorOCCSharedRecipientTransfersDoNotConflict: credits are commutative
+// deltas, so transfers to one recipient neither read nor conflict on its balance.
+func TestExecutorOCCSharedRecipientTransfersDoNotConflict(t *testing.T) {
 	chainID := big.NewInt(testChainID)
 	txCount := 8
 	recipient := testAddress(0xdd)
 	rawTxs := make([][]byte, 0, txCount)
 	seqState := NewMemoryState()
 	occState := NewMemoryState()
+	// An existing recipient: the credits change its balance but not its shape.
+	seqState.SetBalance(recipient, big.NewInt(1))
+	occState.SetBalance(recipient, big.NewInt(1))
 
 	for i := 0; i < txCount; i++ {
 		key, err := crypto.GenerateKey()
@@ -714,19 +719,11 @@ func TestExecutorOCCConflictingTransfersMatchSequential(t *testing.T) {
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
 	require.Empty(t, occResult.OCCStats.FallbackReason)
-	require.Greater(t, occResult.OCCStats.RerunCount, uint64(0))
-	require.Greater(t, occResult.OCCStats.ConflictCount, uint64(0))
-	require.NotEmpty(t, occResult.OCCStats.ConflictSamples)
-	foundRecipientBalanceConflict := false
-	for _, conflict := range occResult.OCCStats.ConflictSamples {
-		if conflict.Kind == "balance" && conflict.Address == recipient {
-			foundRecipientBalanceConflict = true
-			require.Greater(t, conflict.Count, uint64(0))
-		}
-	}
-	require.True(t, foundRecipientBalanceConflict)
+	require.Zero(t, occResult.OCCStats.RerunCount)
+	require.Zero(t, occResult.OCCStats.ConflictCount)
+	require.Empty(t, occResult.OCCStats.ConflictSamples)
 	require.Equal(t, seqState.GetBalance(recipient), occState.GetBalance(recipient))
-	require.Equal(t, big.NewInt(int64(txCount*3)), occState.GetBalance(recipient))
+	require.Equal(t, big.NewInt(int64(txCount*3+1)), occState.GetBalance(recipient))
 }
 
 func TestExecutorOCCFeePayingTransfersDoNotConflictOnCoinbase(t *testing.T) {
@@ -834,6 +831,8 @@ func TestExecutorOCCRerunsWhenLaterTxWritesFeeCreditedCoinbase(t *testing.T) {
 	for _, state := range []*MemoryState{seqState, occState} {
 		state.SetBalance(feePayer, big.NewInt(1_000_000_000))
 		state.SetBalance(transferSender, big.NewInt(1_000_000_000))
+		// An existing coinbase: credits change its balance, not its shape.
+		state.SetBalance(coinbase, big.NewInt(1))
 	}
 
 	feeTx := signLegacyTxWithGasPrice(t, feePayerKey, chainID, 0, &feeRecipient, big.NewInt(0), nil, 100_000, big.NewInt(1))
@@ -851,21 +850,15 @@ func TestExecutorOCCRerunsWhenLaterTxWritesFeeCreditedCoinbase(t *testing.T) {
 
 	require.True(t, occResult.OCCStats.Attempted)
 	require.False(t, occResult.OCCStats.Fallback)
-	require.Equal(t, uint64(1), occResult.OCCStats.RerunCount)
-	// Crediting the coinbase reads its balance first, so under Block-STM the
-	// conflict is a stale read of the fee-credited balance.
-	foundCoinbaseBalanceRead := false
-	for _, conflict := range occResult.OCCStats.ConflictSamples {
-		if conflict.Access == "read" && conflict.Kind == "balance" && conflict.Address == coinbase {
-			foundCoinbaseBalanceRead = true
-		}
-	}
-	require.True(t, foundCoinbaseBalanceRead)
+	// Both the fee credit and the transfer credit are commutative deltas, so the
+	// two transactions do not conflict on the coinbase balance.
+	require.Zero(t, occResult.OCCStats.RerunCount)
+	require.Zero(t, occResult.OCCStats.ConflictCount)
 
 	seqState.ApplyChangeSet(seqResult.ChangeSet)
 	occState.ApplyChangeSet(occResult.ChangeSet)
 	require.Equal(t, seqState.GetBalance(coinbase), occState.GetBalance(coinbase))
-	require.Equal(t, big.NewInt(21_005), occState.GetBalance(coinbase))
+	require.Equal(t, big.NewInt(21_006), occState.GetBalance(coinbase))
 }
 
 func TestExecutorOCCRerunsCoinbaseSpendFundedByPriorFeeCredit(t *testing.T) {
@@ -1662,7 +1655,7 @@ func TestStateDBSelfDestructMarksBalanceWrite(t *testing.T) {
 
 	stateDB.SelfDestruct(contract)
 
-	_, writes := stateDB.takeAccessSets()
+	_, writes, _ := stateDB.takeAccessSets()
 	require.Contains(t, writes, stateAccessKey{kind: stateAccessAccount, address: contract})
 	require.Contains(t, writes, stateAccessKey{kind: stateAccessBalance, address: contract})
 }
@@ -2142,17 +2135,19 @@ func TestStateDBGetCodeHashTracksCodelessAccountExistenceReads(t *testing.T) {
 	stateDB.enableAccessTracking()
 
 	require.Equal(t, ethtypes.EmptyCodeHash, stateDB.GetCodeHash(eoa))
-	readSet, _ := stateDB.takeAccessSets()
+	readSet, _, _ := stateDB.takeAccessSets()
 	require.Contains(t, readSet, stateAccessKey{kind: stateAccessCode, address: eoa})
-	require.Contains(t, readSet, stateAccessKey{kind: stateAccessBalance, address: eoa})
-	require.Contains(t, readSet, stateAccessKey{kind: stateAccessNonce, address: eoa})
+	// A codeless account's hash depends only on whether it exists: an account
+	// (shape) read rather than exact balance and nonce reads.
+	require.Contains(t, readSet, stateAccessKey{kind: stateAccessAccount, address: eoa})
+	require.NotContains(t, readSet, stateAccessKey{kind: stateAccessBalance, address: eoa})
 
 	writes := newStateAccessIndex()
 	writes.addAll(map[stateAccessKey]struct{}{
 		{kind: stateAccessBalance, address: eoa}: {},
 	})
 	validation := occValidationResult{}
-	accepted := validateSTMResultAgainstPrefix(&validation, writes, occTxExecution{gasLimit: 1, readSet: readSet}, 0, 10, 0)
+	accepted := validateSTMResultAgainstPrefix(&validation, writes, occTxExecution{gasLimit: 1, readSet: readSet}, 0, 10, 0, nil)
 	require.False(t, accepted)
 	require.Equal(t, occFallbackReasonConflict, validation.fallbackReason)
 }
@@ -2264,7 +2259,7 @@ func TestValidateSTMConflictMatrix(t *testing.T) {
 			t.Fatalf("unknown access mode %q", access)
 		}
 		validation := occValidationResult{}
-		accepted := validateSTMResultAgainstPrefix(&validation, writes, result, 0, 10, 0)
+		accepted := validateSTMResultAgainstPrefix(&validation, writes, result, 0, 10, 0, nil)
 		return accepted, validation
 	}
 
@@ -2306,7 +2301,7 @@ func TestValidateSTMConflictSourcePrefix(t *testing.T) {
 			readSet:  map[stateAccessKey]struct{}{key: {}},
 			gasLimit: 1,
 			gasUsed:  1,
-		}, 0, 10, sourcePrefix)
+		}, 0, 10, sourcePrefix, nil)
 		return accepted, validation
 	}
 	cases := []struct {
@@ -2365,7 +2360,7 @@ func TestNeedsSTMRerunReturnsGasLimitErrorAfterValidatedPrefix(t *testing.T) {
 	result := occTxExecution{gasLimit: 90_000, gasUsed: 21_000}
 	validation := occValidationResult{}
 
-	rerun, err := needsSTMRerun(&validation, newStateAccessIndex(), result, 21_000, 100_000, 1, 1, 1)
+	rerun, err := needsSTMRerun(&validation, newStateAccessIndex(), nil, result, 21_000, 100_000, 1, 1, 1)
 
 	require.False(t, rerun)
 	require.ErrorIs(t, err, core.ErrGasLimitReached)
@@ -2376,7 +2371,7 @@ func TestNeedsSTMRerunQueuesGasLimitRerunBeforeValidatedPrefix(t *testing.T) {
 	result := occTxExecution{gasLimit: 90_000, gasUsed: 21_000}
 	validation := occValidationResult{}
 
-	rerun, err := needsSTMRerun(&validation, newStateAccessIndex(), result, 21_000, 100_000, 0, 1, 1)
+	rerun, err := needsSTMRerun(&validation, newStateAccessIndex(), nil, result, 21_000, 100_000, 0, 1, 1)
 
 	require.NoError(t, err)
 	require.True(t, rerun)
@@ -2406,9 +2401,17 @@ func TestExecutorOCCHotRecipientChainDoesNotExhaustIncarnations(t *testing.T) {
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
 	require.Empty(t, result.OCCStats.FallbackReason)
-	require.GreaterOrEqual(t, result.OCCStats.RerunCount, uint64(1))
+	// The recipient does not exist yet, so the first credit changes its shape
+	// (empty -> non-empty) and transactions that checked existence before that
+	// credit landed rerun. An abort of one of them marks its credit as an
+	// estimate, which can invalidate a neighbour once more, but later credits
+	// are commutative deltas, so the cascade is shallow and nothing approaches
+	// the incarnation cap.
 	require.Less(t, result.OCCStats.MaxIncarnation, uint64(occMaxTxIncarnations))
-	require.GreaterOrEqual(t, result.OCCStats.ValidationCount, uint64(txCount)+result.OCCStats.RerunCount)
+	require.LessOrEqual(t, result.OCCStats.RerunCount, uint64(3*(txCount-1)))
+	for _, sample := range result.OCCStats.ConflictSamples {
+		require.Equal(t, "account", sample.Kind, "only the existence check may conflict")
+	}
 
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, big.NewInt(int64(txCount)), state.GetBalance(recipient))

@@ -22,7 +22,8 @@ type occTxExecution struct {
 	receipt                  *ethtypes.Receipt
 	changeSet                StateChangeSet
 	readSet                  map[stateAccessKey]struct{}
-	reads                    []mvRead // Block-STM: resolved reads with origins
+	accountShapes            map[common.Address]accountShape // shapes observed by account-kind reads
+	reads                    []mvRead                        // Block-STM: resolved reads with origins
 	writeSet                 map[stateAccessKey]struct{}
 	gasUsed                  uint64
 	gasLimit                 uint64
@@ -263,11 +264,12 @@ func (e *Executor) executeTxSpeculative(
 		txIndexUint,
 		baseFee,
 	)
-	readSet, writeSet := stateDB.takeAccessSets()
+	readSet, writeSet, shapes := stateDB.takeAccessSets()
 	result := occTxExecution{
 		txResult:                 txResult,
 		receipt:                  receipt,
 		readSet:                  readSet,
+		accountShapes:            shapes,
 		writeSet:                 writeSet,
 		gasUsed:                  txResult.GasUsed,
 		gasLimit:                 p.Tx.Gas(),
@@ -336,6 +338,7 @@ func validateBlockSTMFrontier(
 		needsRerun, err := needsSTMRerun(
 			validation,
 			state.writes,
+			state.prefix,
 			result,
 			state.cumulativeGasUsed,
 			runner.blockGasLimit,
@@ -376,6 +379,7 @@ func validateBlockSTMFrontier(
 func needsSTMRerun(
 	validation *occValidationResult,
 	writes *stateAccessIndex,
+	prefix StateReader,
 	result occTxExecution,
 	cumulativeGasUsed uint64,
 	gasLimit uint64,
@@ -395,7 +399,7 @@ func needsSTMRerun(
 		}
 		return nextToValidate > sourcePrefix, nil
 	}
-	return !validateSTMResultAgainstPrefix(validation, writes, result, cumulativeGasUsed, gasLimit, sourcePrefix), nil
+	return !validateSTMResultAgainstPrefix(validation, writes, result, cumulativeGasUsed, gasLimit, sourcePrefix, prefix), nil
 }
 
 func newSTMRerunTask(
@@ -475,12 +479,13 @@ func validateSTMResultAgainstPrefix(
 	cumulativeGasUsed uint64,
 	gasLimit uint64,
 	sourcePrefix int,
+	prefix StateReader,
 ) bool {
 	if err := stmGasValidationError(validation, result, cumulativeGasUsed, gasLimit); err != nil {
 		return false
 	}
 	conflictsBefore := validation.conflictCount
-	validation.addConflicts("read", writes, result.readSet, sourcePrefix)
+	validation.addReadConflicts(writes, result.readSet, result.accountShapes, prefix, sourcePrefix)
 	validation.addConflicts("write", writes, result.writeSet, sourcePrefix)
 	if validation.conflictCount == conflictsBefore {
 		return true
@@ -506,17 +511,42 @@ func (r *occValidationResult) addConflicts(access string, writes *stateAccessInd
 		if !writes.conflictsWithAfter(key, sourcePrefix) {
 			continue
 		}
-		if r.conflicts == nil {
-			r.conflicts = map[occConflictAggregationKey]uint64{}
-		}
-		r.conflictCount++
-		r.conflicts[occConflictAggregationKey{
-			access:  access,
-			kind:    key.kind,
-			address: key.address,
-			slot:    key.slot,
-		}]++
+		r.recordConflict(access, key)
 	}
+}
+
+// addReadConflicts checks a read set. An account-kind read whose observed shape
+// is known is compared against the shape the prefix now yields instead of
+// against the write index, so credits that keep an account non-empty do not
+// conflict with existence checks. Without a prefix it falls back to the index.
+func (r *occValidationResult) addReadConflicts(writes *stateAccessIndex, set map[stateAccessKey]struct{}, shapes map[common.Address]accountShape, prefix StateReader, sourcePrefix int) {
+	for key := range set {
+		if key.kind == stateAccessAccount && prefix != nil {
+			if shape, ok := shapes[key.address]; ok {
+				if accountShapeOf(prefix, key.address) != shape {
+					r.recordConflict("read", key)
+				}
+				continue
+			}
+		}
+		if !writes.conflictsWithAfter(key, sourcePrefix) {
+			continue
+		}
+		r.recordConflict("read", key)
+	}
+}
+
+func (r *occValidationResult) recordConflict(access string, key stateAccessKey) {
+	if r.conflicts == nil {
+		r.conflicts = map[occConflictAggregationKey]uint64{}
+	}
+	r.conflictCount++
+	r.conflicts[occConflictAggregationKey{
+		access:  access,
+		kind:    key.kind,
+		address: key.address,
+		slot:    key.slot,
+	}]++
 }
 
 func (r occValidationResult) stats(fallback bool) OCCStats {

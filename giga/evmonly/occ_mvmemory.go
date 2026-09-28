@@ -239,6 +239,7 @@ type mvRead struct {
 	u256   uint256.Int
 	nonce  uint64
 	code   []byte
+	shape  accountShape // account-kind reads only
 }
 
 // mvResolution is the outcome of resolving one key at one index.
@@ -497,6 +498,17 @@ func (m *mvMemory) validateReadSet(txIdx int, valueBased bool) (bool, []stateAcc
 		r := &reads[i]
 		ok := true
 		switch r.key.kind {
+		case stateAccessAccount:
+			// Shape reads are value-based by nature: only zero-ness matters.
+			bal, resB := m.resolveBalance(r.key.address, txIdx, foldBuf[:0])
+			foldBuf = resB.fold
+			nonce, resN := m.resolveNonce(r.key.address, txIdx)
+			code, resC := m.resolveCode(r.key.address, txIdx)
+			if resB.blocking >= 0 || resB.overflow || resN.blocking >= 0 || resC.blocking >= 0 {
+				ok = false
+				break
+			}
+			ok = accountShape{nonceZero: nonce == 0, balanceZero: bal.IsZero(), codeEmpty: len(code) == 0} == r.shape
 		case stateAccessBalance:
 			var val uint256.Int
 			var res mvResolution

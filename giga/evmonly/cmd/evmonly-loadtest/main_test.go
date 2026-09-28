@@ -96,6 +96,10 @@ func TestTransferWorkloadOCCScenarios(t *testing.T) {
 	}{
 		{name: "conflict free"},
 		{
+			// Credits are commutative deltas, so a shared recipient's balance is not
+			// a conflict. The recipient does not exist in genesis, though, so the
+			// first credit changes its shape and the block that creates it reruns
+			// the transactions that checked existence first.
 			name:              "hot recipient",
 			args:              []string{"--recipient=0x00000000000000000000000000000000000000f1"},
 			wantConflicts:     true,
@@ -319,7 +323,7 @@ func TestTransferWorkloadRecipientConflictRate(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
-	require.Greater(t, result.OCCStats.ConflictCount, uint64(0))
+	require.Greater(t, result.OCCStats.ConflictCount, uint64(0), "the paired recipients are created in this block")
 	require.Greater(t, result.OCCStats.RerunCount, uint64(0))
 
 	conflictRecipient := workload.Recipient(1, 0, 1)
