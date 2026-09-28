@@ -68,9 +68,11 @@ type fileResultSinks struct {
 	changeSetFile *appendRLPFile
 	receiptFile   *appendRLPFile
 	metrics       *loadMetrics
-	cleanupMu     sync.Mutex
-	paths         []string
-	cleaned       map[string]struct{}
+	// keep leaves the files in place at shutdown instead of removing them.
+	keep      bool
+	cleanupMu sync.Mutex
+	paths     []string
+	cleaned   map[string]struct{}
 }
 
 func newFileResultSinks(cfg config, metrics *loadMetrics) (*resultSinks, error) {
@@ -81,6 +83,7 @@ func newFileResultSinks(cfg config, metrics *loadMetrics) (*resultSinks, error) 
 	receiptPath := filepath.Join(cfg.persistDir, "receipts.rlp")
 	files := &fileResultSinks{
 		metrics: metrics,
+		keep:    cfg.keepPersist,
 		paths:   []string{changeSetPath, receiptPath},
 		cleaned: map[string]struct{}{},
 	}
@@ -114,6 +117,9 @@ func (s *fileResultSinks) Close() error {
 }
 
 func (s *fileResultSinks) Cleanup() error {
+	if s.keep {
+		return nil
+	}
 	s.cleanupMu.Lock()
 	defer s.cleanupMu.Unlock()
 

@@ -174,6 +174,10 @@ Useful knobs:
 - `--persist-dir`: directory used by `--result-sink=file` for temporary
   append-only changeset and receipt files. Files are removed on shutdown or
   interrupt cleanup.
+- `--keep-persist`: leave the `--result-sink=file` outputs in place at
+  shutdown. With `--builders=1` the transaction-to-block grouping is
+  deterministic, so two runs with different `--occ-mode` or
+  `--executor-workers` values can be compared byte for byte with `cmp`.
 - `--persist-buffer-size`: buffered writer size for `--result-sink=file`.
 - `--persist-queue-size`: async file-sink record queue size. The default `0`
   uses `2 * --queue-size`.
@@ -223,7 +227,7 @@ executor's `evmonly.ResultSink` interface. The writer appends changesets to
 `changesets.rlp` and receipts to `receipts.rlp` under `--persist-dir`; each
 record is framed as an 8-byte big-endian block height, an 8-byte big-endian RLP
 payload length, and the RLP payload. The files are temporary calibration
-artifacts and are removed when the process exits normally or handles
+artifacts and, unless `--keep-persist` is set, are removed when the process exits normally or handles
 `SIGINT`/`SIGTERM`. `sink_enqueue_wait` is the primary backpressure signal: a
 non-zero value means executor workers waited for async sink queue capacity.
 

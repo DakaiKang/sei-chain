@@ -61,6 +61,7 @@ type config struct {
 	storageDir             string
 	persistDir             string
 	persistSync            bool
+	keepPersist            bool
 	persistBufferSize      int
 	persistQueueSize       int
 	cpuProfile             string
@@ -145,7 +146,8 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.resultSink, "result-sink", resultSinkDiscard, "result sink mode: discard or file")
 	fs.IntVar(&cfg.resultPoolSize, "result-pool-size", 0, "pooled executor BlockResult slots; 0 sizes for in-flight sink results, negative disables pooling")
 	fs.StringVar(&cfg.storageDir, "storage-dir", "", "GigaStorageManager home directory; empty uses a temporary directory removed on exit")
-	fs.StringVar(&cfg.persistDir, "persist-dir", "", "directory for --result-sink=file append-only changeset and receipt files, removed at shutdown")
+	fs.StringVar(&cfg.persistDir, "persist-dir", "", "directory for --result-sink=file append-only changeset and receipt files, removed at shutdown unless --keep-persist is set")
+	fs.BoolVar(&cfg.keepPersist, "keep-persist", false, "leave --result-sink=file outputs in place at shutdown, for example to diff engines")
 	fs.BoolVar(&cfg.persistSync, "persist-sync", false, "fsync persistent result files from the async sink writer")
 	fs.IntVar(&cfg.persistBufferSize, "persist-buffer-size", defaultPersistBuffer, "buffer size in bytes for --result-sink=file")
 	fs.IntVar(&cfg.persistQueueSize, "persist-queue-size", 0, "record queue size for async file persistence; 0 defaults to 2*queue-size")
@@ -290,6 +292,9 @@ func parseConfig(args []string) (config, error) {
 		cfg.resultPoolSize = 0
 	} else if cfg.resultPoolSize == 0 {
 		cfg.resultPoolSize = defaultResultPoolSize(cfg)
+	}
+	if cfg.keepPersist && cfg.resultSink != resultSinkFile {
+		return config{}, fmt.Errorf("keep-persist requires result-sink=file")
 	}
 	if cfg.resultSink == resultSinkFile && strings.TrimSpace(cfg.persistDir) == "" {
 		return config{}, fmt.Errorf("persist-dir is required when result-sink=file")

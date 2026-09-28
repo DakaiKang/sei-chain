@@ -152,6 +152,9 @@ func TestTransferWorkloadOCCScenarios(t *testing.T) {
 			executor := evmonly.NewExecutor(evmonly.Config{
 				MinGasPrice: cfg.minGasPrice,
 				OCCWorkers:  4,
+				// Exact rerun and conflict counts describe the snapshot engine; Block-STM
+				// coverage of these workloads is TestWorkloadsMatchSequentialAcrossModes.
+				OCCMode: evmonly.OCCModeSnapshot,
 			}, withGeneratedState(state))
 			result, err := executor.ExecuteBlock(t.Context(), request)
 			require.NoError(t, err)
@@ -308,6 +311,9 @@ func TestTransferWorkloadRecipientConflictRate(t *testing.T) {
 	executor := evmonly.NewExecutor(evmonly.Config{
 		MinGasPrice: cfg.minGasPrice,
 		OCCWorkers:  4,
+		// Exact rerun and conflict counts describe the snapshot engine; Block-STM
+		// coverage of these workloads is TestWorkloadsMatchSequentialAcrossModes.
+		OCCMode: evmonly.OCCModeSnapshot,
 	}, withGeneratedState(state))
 	result, err := executor.ExecuteBlock(t.Context(), request)
 	require.NoError(t, err)
@@ -987,4 +993,104 @@ func TestOCCModeFlag(t *testing.T) {
 
 	_, err = parseConfig([]string{"--blocks=1", "--occ-mode=turbo"})
 	require.ErrorContains(t, err, "unsupported occ mode")
+}
+
+func TestKeepPersistFlag(t *testing.T) {
+	cfg, err := parseConfig([]string{"--blocks=1", "--result-sink=file", "--persist-dir=" + t.TempDir(), "--keep-persist"})
+	require.NoError(t, err)
+	require.True(t, cfg.keepPersist)
+
+	cfg, err = parseConfig([]string{"--blocks=1"})
+	require.NoError(t, err)
+	require.False(t, cfg.keepPersist)
+
+	_, err = parseConfig([]string{"--blocks=1", "--keep-persist"})
+	require.ErrorContains(t, err, "keep-persist requires result-sink=file")
+}
+
+func TestRunPrebuiltBlocksWithFileResultSinkKeepsFilesWithKeepPersist(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := parseConfig([]string{
+		"--metrics-addr=",
+		"--report-interval=0",
+		"--blocks=2",
+		"--txs-per-block=2",
+		"--gas-price-wei=0",
+		"--min-gas-price-wei=0",
+		"--result-sink=file",
+		"--keep-persist",
+		"--persist-dir=" + dir,
+	})
+	require.NoError(t, err)
+	require.NoError(t, run(cfg))
+
+	var changes evmonly.StateChangeSet
+	require.Equal(t, uint64(2), readPersistedRLPRecord(t, filepath.Join(dir, "changesets.rlp"), &changes))
+	var receipts ethtypes.Receipts
+	require.Equal(t, uint64(2), readPersistedRLPRecord(t, filepath.Join(dir, "receipts.rlp"), &receipts))
+}
+
+// TestWorkloadsMatchSequentialAcrossModes checks that every load-test workload
+// produces the same block result under both parallel engines as under
+// sequential execution.
+func TestWorkloadsMatchSequentialAcrossModes(t *testing.T) {
+	workloads := []struct {
+		name string
+		args []string
+	}{
+		{name: "transfer conflict free"},
+		{name: "transfer hot recipient", args: []string{"--recipient=0x00000000000000000000000000000000000000f1"}},
+		{name: "transfer same sender", args: []string{"--same-sender"}},
+		{name: "transfer conflict rate", args: []string{"--recipient-conflict-rate=0.5"}},
+		{name: "transfer with fees", args: []string{"--gas-price-wei=1000000000", "--min-gas-price-wei=1000000000", "--recipient-conflict-rate=0.5"}},
+		{name: "erc20 transfer", args: []string{"--workload=erc20-transfer"}},
+		{name: "snapshot revert", args: []string{"--workload=snapshot-revert"}},
+	}
+	type engine struct {
+		name    string
+		workers int
+		mode    evmonly.OCCMode
+	}
+	engines := []engine{
+		{name: "blockstm-2", workers: 2, mode: evmonly.OCCModeBlockSTM},
+		{name: "blockstm-4", workers: 4, mode: evmonly.OCCModeBlockSTM},
+		{name: "snapshot-4", workers: 4, mode: evmonly.OCCModeSnapshot},
+	}
+	runWorkload := func(t *testing.T, args []string, workers int, mode evmonly.OCCMode) *evmonly.BlockResult {
+		t.Helper()
+		base := []string{"--metrics-addr=", "--blocks=1", "--txs-per-block=24", "--gas-price-wei=0", "--min-gas-price-wei=0"}
+		cfg, err := parseConfig(append(base, args...))
+		require.NoError(t, err)
+		state := newGeneratedState()
+		workload, err := scenarios.NewWorkload(cfg.workload, scenarioConfig(cfg), state)
+		require.NoError(t, err)
+		request, err := workload.BuildBlock(t.Context(), 1)
+		require.NoError(t, err)
+		executor := evmonly.NewExecutor(evmonly.Config{
+			MinGasPrice: cfg.minGasPrice,
+			OCCWorkers:  workers,
+			OCCMode:     mode,
+		}, withGeneratedState(state))
+		defer executor.Close()
+		result, err := executor.ExecuteBlock(t.Context(), request)
+		require.NoError(t, err)
+		return result
+	}
+	for _, wl := range workloads {
+		t.Run(wl.name, func(t *testing.T) {
+			sequential := runWorkload(t, wl.args, 1, evmonly.OCCModeBlockSTM)
+			require.False(t, sequential.OCCStats.Attempted)
+			for _, eng := range engines {
+				t.Run(eng.name, func(t *testing.T) {
+					result := runWorkload(t, wl.args, eng.workers, eng.mode)
+					require.True(t, result.OCCStats.Attempted)
+					require.False(t, result.OCCStats.Fallback)
+					require.Equal(t, sequential.GasUsed, result.GasUsed)
+					require.Equal(t, sequential.Txs, result.Txs)
+					require.Equal(t, sequential.Receipts, result.Receipts)
+					require.Equal(t, sequential.ChangeSet, result.ChangeSet)
+				})
+			}
+		})
+	}
 }
