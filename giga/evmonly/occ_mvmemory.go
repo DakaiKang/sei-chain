@@ -107,6 +107,9 @@ const mvShardCount = 256
 type mvShard struct {
 	mu   sync.RWMutex
 	locs map[stateAccessKey]*mvLocation
+	// pool holds this shard's released locations for reuse in later blocks. It
+	// is only touched under mu, so each shard recycles its own locations.
+	pool []*mvLocation
 }
 
 func mvShardIndex(k stateAccessKey) int {
@@ -132,7 +135,6 @@ type mvMemory struct {
 	shards    [mvShardCount]mvShard
 	txs       []mvTxState
 	hasClears atomic.Bool
-	locPool   []*mvLocation
 }
 
 func newMVMemory() *mvMemory {
@@ -156,7 +158,7 @@ func (m *mvMemory) reset(snapshot StateReader, txCount int) {
 				loc.entries[j] = mvEntry{}
 			}
 			loc.entries = loc.entries[:0]
-			m.locPool = append(m.locPool, loc)
+			shard.pool = append(shard.pool, loc)
 		}
 		clear(shard.locs)
 	}
@@ -192,9 +194,10 @@ func (m *mvMemory) lookupOrCreate(k stateAccessKey) *mvLocation {
 	if loc = shard.locs[k]; loc != nil {
 		return loc
 	}
-	if n := len(m.locPool); n > 0 {
-		loc = m.locPool[n-1]
-		m.locPool = m.locPool[:n-1]
+	if n := len(shard.pool); n > 0 {
+		loc = shard.pool[n-1]
+		shard.pool[n-1] = nil
+		shard.pool = shard.pool[:n-1]
 	} else {
 		loc = &mvLocation{}
 	}
@@ -357,7 +360,7 @@ func (m *mvMemory) resolveStorage(addr common.Address, slot common.Hash, txIdx i
 // and reports whether any location was written for the first time by this
 // transaction.
 func (m *mvMemory) record(txIdx, incarnation int, exec *occTxExecution) bool {
-	v := txVersion{txIdx: int32(txIdx), incarnation: int32(incarnation)}
+	v := txVersion{txIdx: int32(txIdx), incarnation: int32(incarnation)} //nolint:gosec // bounded by block size and occMaxTxIncarnations.
 	st := &m.txs[txIdx]
 	newKeys := make([]stateAccessKey, 0, len(exec.changeSet.Balances)+len(exec.changeSet.Nonces)+len(exec.changeSet.Code)+len(exec.changeSet.StorageClears)+len(exec.changeSet.Storage))
 	if exec.err == nil {

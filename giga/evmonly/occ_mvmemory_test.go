@@ -3,6 +3,7 @@ package evmonly
 import (
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -320,4 +321,37 @@ func TestUint256FromBigOrMax(t *testing.T) {
 	require.Equal(t, uint64(7), seven.Uint64())
 	huge := uint256FromBigOrMax(new(big.Int).Lsh(big.NewInt(1), 260))
 	require.True(t, huge.Eq(new(uint256.Int).SetAllOne()))
+}
+
+// TestMVMemoryReuseAcrossBlocksKeepsLocationsDistinct reuses one memory for a
+// second block and creates locations from many goroutines, as workers do. Every
+// key must get its own version list; a shared list mixes values between keys.
+func TestMVMemoryReuseAcrossBlocksKeepsLocationsDistinct(t *testing.T) {
+	const keys = 512
+	m := mvTestMemory(t, 1, NewMemoryState())
+	for i := range keys {
+		m.lookupOrCreate(stateAccessKey{kind: stateAccessStorage, address: mvTestAddr, slot: common.BigToHash(big.NewInt(int64(i)))})
+	}
+	m.reset(NewMemoryState(), 1)
+
+	locs := make([]*mvLocation, keys)
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := w; i < keys; i += 8 {
+				locs[i] = m.lookupOrCreate(stateAccessKey{kind: stateAccessNonce, address: common.BigToAddress(big.NewInt(int64(i + 1)))})
+			}
+		}()
+	}
+	wg.Wait()
+	seen := make(map[*mvLocation]int, keys)
+	for i, loc := range locs {
+		require.NotNil(t, loc)
+		if prev, dup := seen[loc]; dup {
+			t.Fatalf("keys %d and %d share a location", prev, i)
+		}
+		seen[loc] = i
+	}
 }

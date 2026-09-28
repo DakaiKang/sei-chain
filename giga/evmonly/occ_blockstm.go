@@ -35,13 +35,14 @@ type occBlockSTMStats struct {
 
 func (s *occBlockSTMStats) recordAbort(nextIncarnation int, stale []stateAccessKey, staleCount int) {
 	s.rerunCount.Add(1)
+	next := uint64(nextIncarnation) //nolint:gosec // bounded by occMaxTxIncarnations.
 	for {
 		cur := s.maxIncarnation.Load()
-		if uint64(nextIncarnation) <= cur || s.maxIncarnation.CompareAndSwap(cur, uint64(nextIncarnation)) {
+		if next <= cur || s.maxIncarnation.CompareAndSwap(cur, next) {
 			break
 		}
 	}
-	s.conflictCount.Add(uint64(staleCount))
+	s.conflictCount.Add(uint64(staleCount)) //nolint:gosec // a count, never negative.
 	if len(stale) == 0 {
 		return
 	}
