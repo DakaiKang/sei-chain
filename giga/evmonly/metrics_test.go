@@ -100,23 +100,26 @@ func requireHistogram(t *testing.T, collected map[string]metricdata.Metrics, nam
 	return histogram.DataPoints[0]
 }
 
-// conflictingTransferBlock returns a block whose first transaction credits a
-// hot account and whose remaining transactions are sent by that account, so
-// they read a balance an earlier transaction changed and optimistic execution
-// observes balance conflicts without falling back. It returns the hot address.
+// conflictingTransferBlock returns a block whose first transaction funds an
+// empty hot account and whose remaining transactions are sent by that account,
+// so optimistic execution observes balance conflicts without falling back. It
+// returns the hot address.
 func conflictingTransferBlock(t *testing.T, txCount int) (BlockRequest, *MemoryState, common.Address) {
 	t.Helper()
 	chainID := big.NewInt(testChainID)
 	state := NewMemoryState()
 	hotKey, err := crypto.GenerateKey()
 	require.NoError(t, err)
+	// The hot account starts empty: every transfer it sends can only be paid
+	// from the first transaction's credit, so a speculative run against the
+	// block's starting state fails its balance check and records an exact
+	// balance read that the credit invalidates.
 	hot := crypto.PubkeyToAddress(hotKey.PublicKey)
-	state.SetBalance(hot, big.NewInt(1_000_000))
 	funderKey, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	state.SetBalance(crypto.PubkeyToAddress(funderKey.PublicKey), big.NewInt(1_000_000))
 	rawTxs := make([][]byte, 0, txCount)
-	rawTxs = append(rawTxs, signLegacyTxWithGasPrice(t, funderKey, chainID, 0, &hot, big.NewInt(3), nil, 100_000, big.NewInt(0)))
+	rawTxs = append(rawTxs, signLegacyTxWithGasPrice(t, funderKey, chainID, 0, &hot, big.NewInt(int64(txCount)), nil, 100_000, big.NewInt(0)))
 	for i := 1; i < txCount; i++ {
 		sink := testAddress(byte(0x40 + i))
 		rawTxs = append(rawTxs, signLegacyTxWithGasPrice(t, hotKey, chainID, uint64(i-1), &sink, big.NewInt(1), nil, 100_000, big.NewInt(0)))

@@ -35,7 +35,8 @@ const (
 type mvEntry struct {
 	version txVersion
 	kind    mvEntryKind
-	u256    uint256.Int // balance value, delta amount, or storage slot (big-endian)
+	u256    uint256.Int // balance value, delta magnitude, or storage slot (big-endian)
+	neg     bool        // delta only: the delta is a debit
 	nonce   uint64
 	code    []byte // immutable once stored; nil means no code
 }
@@ -240,6 +241,9 @@ type mvRead struct {
 	nonce  uint64
 	code   []byte
 	shape  accountShape // account-kind reads only
+	// guard marks a balance read that only requires the balance to be at least
+	// u256, not to equal it.
+	guard bool
 }
 
 // mvResolution is the outcome of resolving one key at one index.
@@ -252,7 +256,7 @@ type mvResolution struct {
 
 func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVersion) (uint256.Int, mvResolution) {
 	res := mvResolution{blocking: -1}
-	var sum uint256.Int
+	var credits, debits uint256.Int
 	var base uint256.Int
 	found := false
 	if loc := m.lookup(stateAccessKey{kind: stateAccessBalance, address: addr}); loc != nil {
@@ -264,7 +268,11 @@ func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVe
 				res.blocking = int(e.version.txIdx)
 			case mvDelta:
 				foldBuf = append(foldBuf, e.version)
-				if _, carry := sum.AddOverflow(&sum, &e.u256); carry {
+				acc := &credits
+				if e.neg {
+					acc = &debits
+				}
+				if _, carry := acc.AddOverflow(acc, &e.u256); carry {
 					res.overflow = true
 				}
 				continue
@@ -291,9 +299,15 @@ func (m *mvMemory) resolveBalance(addr common.Address, txIdx int, foldBuf []txVe
 		res.origin = readOrigin{kind: originSnapshot}
 	}
 	var out uint256.Int
-	if _, carry := out.AddOverflow(&base, &sum); carry {
+	if _, carry := out.AddOverflow(&base, &credits); carry {
 		res.overflow = true
 	}
+	if out.Cmp(&debits) < 0 {
+		// Debits exceed the available balance: a stale view of a guarded sender.
+		res.overflow = true
+		return uint256.Int{}, res
+	}
+	out.Sub(&out, &debits)
 	return out, res
 }
 
@@ -372,7 +386,8 @@ func (m *mvMemory) record(txIdx, incarnation int, exec *occTxExecution) bool {
 			_, normal := exec.writeSet[k]
 			if delta != nil && !normal {
 				e.kind = mvDelta
-				e.u256 = uint256FromBigOrMax(delta)
+				e.neg = delta.Sign() < 0
+				e.u256 = uint256FromBigOrMax(new(big.Int).Abs(delta))
 			} else {
 				e.u256 = uint256FromBigOrMax(ch.Balance)
 			}
@@ -517,6 +532,8 @@ func (m *mvMemory) validateReadSet(txIdx int, valueBased bool) (bool, []stateAcc
 			switch {
 			case res.blocking >= 0 || res.overflow:
 				ok = false
+			case r.guard:
+				ok = val.Cmp(&r.u256) >= 0
 			case valueBased:
 				ok = val.Eq(&r.u256)
 			default:
@@ -599,12 +616,16 @@ func (m *mvMemory) ChangeSetInto(changes *StateChangeSet) {
 			}
 			switch k.kind {
 			case stateAccessBalance:
-				var sum uint256.Int
+				var credits, debits uint256.Int
 				var base *uint256.Int
 				for j := len(loc.entries) - 1; j >= 0; j-- {
 					e := &loc.entries[j]
 					if e.kind == mvDelta {
-						sum.Add(&sum, &e.u256)
+						if e.neg {
+							debits.Add(&debits, &e.u256)
+						} else {
+							credits.Add(&credits, &e.u256)
+						}
 						continue
 					}
 					if e.kind == mvValue {
@@ -616,11 +637,12 @@ func (m *mvMemory) ChangeSetInto(changes *StateChangeSet) {
 				if base == nil {
 					b, err := uint256FromBig(m.snapshot.GetBalance(k.address))
 					if err == nil {
-						out.Add(b, &sum)
+						out.Add(b, &credits)
 					}
 				} else {
-					out.Add(base, &sum)
+					out.Add(base, &credits)
 				}
+				out.Sub(&out, &debits)
 				final.balances[k.address] = out.ToBig()
 			case stateAccessNonce:
 				final.nonces[k.address] = top.nonce

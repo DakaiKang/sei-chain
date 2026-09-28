@@ -51,7 +51,7 @@ func TestMVReaderShapeReadsCollectAsAccountKind(t *testing.T) {
 	_ = reader.GetNonce(mvTestAddr)
 	_ = reader.GetCode(mvTestAddr)
 	reader.observeRead(stateAccessKey{kind: stateAccessAccount, address: mvTestAddr})
-	reads := reader.collect()
+	reads := reader.collect(nil)
 	require.Len(t, reads, 1)
 	require.Equal(t, stateAccessAccount, reads[0].key.kind)
 	require.Equal(t, accountShape{nonceZero: true, balanceZero: false, codeEmpty: true}, reads[0].shape)

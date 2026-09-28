@@ -1053,10 +1053,11 @@ func TestExecutorOCCRerunsSameSenderNonceChain(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
-	// The second transaction either reads a stale nonce and reruns, or parks on
-	// the first as a dependency; either way it is not executed for free.
-	require.LessOrEqual(t, result.OCCStats.RerunCount, uint64(1))
-	require.GreaterOrEqual(t, result.OCCStats.RerunCount+result.OCCStats.DependencyAbortCount, uint64(1))
+	// The sender's nonce is predicted from the block order and its gas balance
+	// is a guarded delta, so the second transaction needs neither a rerun nor a
+	// dependency on the first.
+	require.Zero(t, result.OCCStats.RerunCount)
+	require.Zero(t, result.OCCStats.DependencyAbortCount)
 
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, uint64(2), state.GetNonce(sender))
@@ -1655,7 +1656,7 @@ func TestStateDBSelfDestructMarksBalanceWrite(t *testing.T) {
 
 	stateDB.SelfDestruct(contract)
 
-	_, writes, _ := stateDB.takeAccessSets()
+	_, writes, _, _ := stateDB.takeAccessSets()
 	require.Contains(t, writes, stateAccessKey{kind: stateAccessAccount, address: contract})
 	require.Contains(t, writes, stateAccessKey{kind: stateAccessBalance, address: contract})
 }
@@ -2135,7 +2136,7 @@ func TestStateDBGetCodeHashTracksCodelessAccountExistenceReads(t *testing.T) {
 	stateDB.enableAccessTracking()
 
 	require.Equal(t, ethtypes.EmptyCodeHash, stateDB.GetCodeHash(eoa))
-	readSet, _, _ := stateDB.takeAccessSets()
+	readSet, _, _, _ := stateDB.takeAccessSets()
 	require.Contains(t, readSet, stateAccessKey{kind: stateAccessCode, address: eoa})
 	// A codeless account's hash depends only on whether it exists: an account
 	// (shape) read rather than exact balance and nonce reads.
@@ -2268,7 +2269,10 @@ func TestValidateSTMConflictMatrix(t *testing.T) {
 			for _, access := range []string{"read", "write"} {
 				t.Run(prior.name+"/"+access+"/"+current.name, func(t *testing.T) {
 					accepted, validation := validate(t, prior.add, access, current.key)
-					if !prior.wantConflicts(current.key) {
+					// A nonce write is covered by the nonce read it derives from and is
+					// never a write-write conflict on its own.
+					nonceWrite := access == "write" && current.key.kind == stateAccessNonce
+					if nonceWrite || !prior.wantConflicts(current.key) {
 						require.True(t, accepted)
 						require.Empty(t, validation.fallbackReason)
 						require.Zero(t, validation.conflictCount)
@@ -2452,9 +2456,10 @@ func TestExecutorOCCSameSenderChainDoesNotExhaustIncarnations(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.OCCStats.Attempted)
 	require.False(t, result.OCCStats.Fallback)
-	require.Less(t, result.OCCStats.MaxIncarnation, uint64(occMaxTxIncarnations))
-	require.GreaterOrEqual(t, result.OCCStats.RerunCount+result.OCCStats.DependencyAbortCount, uint64(1))
-	require.GreaterOrEqual(t, result.OCCStats.ValidationCount, uint64(txCount)+result.OCCStats.RerunCount)
+	// Predicted nonces and guarded gas balances make a same-sender chain
+	// conflict-free.
+	require.Zero(t, result.OCCStats.RerunCount)
+	require.Zero(t, result.OCCStats.DependencyAbortCount)
 	state.ApplyChangeSet(result.ChangeSet)
 	require.Equal(t, uint64(txCount), state.GetNonce(sender))
 }

@@ -125,9 +125,11 @@ func (e *Executor) executeBlockBlockSTM(ctx context.Context, req PreparedBlock, 
 	n := len(req.Txs)
 	mem := e.acquireMVMemory(source, n)
 	defer e.releaseMVMemory(mem)
+	runner := newOCCSpeculativeRunner(e, req)
+	runner.prepareSenderHints(source)
 	run := &occBlockSTMRun{
 		executor:       e,
-		runner:         newOCCSpeculativeRunner(e, req),
+		runner:         runner,
 		req:            req,
 		mem:            mem,
 		sched:          newOCCScheduler(n),
@@ -146,7 +148,11 @@ func (e *Executor) executeBlockBlockSTM(ctx context.Context, req PreparedBlock, 
 	case err != nil:
 		return nil, err
 	}
-	return run.finalize(ctx)
+	result, err := run.finalize(ctx)
+	if errors.Is(err, errOCCNonceHint) {
+		return e.executeBlockOCCSequentialFallback(ctx, req, source, run.stats.validationResult(), occFallbackReasonNonceHint)
+	}
+	return result, err
 }
 
 func (r *occBlockSTMRun) workerLoop(ctx context.Context) error {
@@ -202,6 +208,7 @@ func (r *occBlockSTMRun) executeTask(ctx context.Context, task occTask) (occTask
 			r.runner.blockCtx,
 			r.runner.baseFee,
 			r.runner.blockGasLimit,
+			r.runner.senderHint(task.txIdx),
 		)
 		if r.hooks.afterExecute != nil {
 			r.hooks.afterExecute(task.txIdx, task.incarnation)
@@ -279,6 +286,15 @@ func (r *occBlockSTMRun) finalize(ctx context.Context) (*BlockResult, error) {
 		}
 		if cumulative > limit || res.gasLimit > limit-cumulative {
 			return nil, fmt.Errorf("execute tx %d %s: %w", i, r.req.Txs[i].Tx.Hash(), core.ErrGasLimitReached)
+		}
+		if hint := r.runner.senderHint(i); hint.active {
+			// Verify the nonce premise: every transaction saw the nonce the block
+			// order predicts. A mismatch means another transaction changed this
+			// sender's nonce and the block must be re-executed without predictions.
+			nonce, resolution := r.mem.resolveNonce(r.req.Txs[i].Sender, i)
+			if resolution.blocking >= 0 || nonce != hint.nonce {
+				return nil, errOCCNonceHint
+			}
 		}
 		cumulative += res.gasUsed
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 	"github.com/sei-protocol/sei-chain/giga/evmonly/precompiles"
 	"github.com/sei-protocol/sei-chain/sei-db/ledger_db/receipt"
 	gigatypes "github.com/sei-protocol/sei-chain/sei-db/state_db/giga/types"
@@ -364,7 +365,14 @@ func buildBlockContext(ctx BlockContext) vm.BlockContext {
 	blobBaseFee := cloneOptionalBig(ctx.BlobBaseFee)
 	return vm.BlockContext{
 		CanTransfer: core.CanTransfer,
-		Transfer:    core.Transfer,
+		Transfer: func(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int) {
+			core.Transfer(db, sender, recipient, amount)
+			// The top-level transfer is the last pre-execution step: after it,
+			// balance reads of the sender come from contract code and are exact.
+			if native, ok := db.(*nativeStateDB); ok {
+				native.endSenderPhase()
+			}
+		},
 		GetHash: func(n uint64) common.Hash {
 			if ctx.Number > 0 && n == ctx.Number-1 {
 				return ctx.ParentHash

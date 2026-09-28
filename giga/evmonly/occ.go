@@ -14,6 +14,7 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 	"github.com/sei-protocol/sei-chain/sei-tendermint/libs/utils"
 )
 
@@ -23,6 +24,7 @@ type occTxExecution struct {
 	changeSet                StateChangeSet
 	readSet                  map[stateAccessKey]struct{}
 	accountShapes            map[common.Address]accountShape // shapes observed by account-kind reads
+	balanceGuards            map[common.Address]*uint256.Int // minimum starting balances the tx relied on
 	reads                    []mvRead                        // Block-STM: resolved reads with origins
 	writeSet                 map[stateAccessKey]struct{}
 	gasUsed                  uint64
@@ -46,6 +48,54 @@ type occSpeculativeRunner struct {
 	blockCtx      vm.BlockContext
 	baseFee       *big.Int
 	blockGasLimit uint64
+	// senderHints[i] is the predicted nonce and BuyGas requirement of tx i.
+	senderHints []senderHintSpec
+}
+
+// senderHintSpec is what the executor knows about a transaction's sender before
+// running it: the nonce it must have if every earlier transaction of that sender
+// in the block is valid, and the balance geth's BuyGas will require.
+type senderHintSpec struct {
+	active       bool
+	nonce        uint64
+	balanceCheck uint256.Int
+}
+
+// prepareSenderHints predicts each transaction's sender nonce from the block
+// order and computes its BuyGas requirement.
+func (r *occSpeculativeRunner) prepareSenderHints(source StateReader) {
+	hints := make([]senderHintSpec, len(r.req.Txs))
+	baseNonce := make(map[common.Address]uint64, len(r.req.Txs))
+	for i, p := range r.req.Txs {
+		nonce, seen := baseNonce[p.Sender]
+		if !seen {
+			nonce = source.GetNonce(p.Sender)
+		}
+		baseNonce[p.Sender] = nonce + 1
+		check := new(big.Int).SetUint64(p.Tx.Gas())
+		check.Mul(check, p.Tx.GasFeeCap())
+		check.Add(check, p.Tx.Value())
+		checkU256, overflow := uint256.FromBig(check)
+		if overflow {
+			continue // geth rejects the transaction; run it without a hint
+		}
+		hints[i] = senderHintSpec{active: true, nonce: nonce, balanceCheck: *checkU256}
+	}
+	r.senderHints = hints
+}
+
+func (r *occSpeculativeRunner) senderHint(txIndex int) senderHintSpec {
+	if txIndex < len(r.senderHints) {
+		return r.senderHints[txIndex]
+	}
+	return senderHintSpec{}
+}
+
+// applySenderHint installs the hint on a StateDB before a transaction runs.
+func applySenderHint(stateDB *nativeStateDB, sender common.Address, hint senderHintSpec) {
+	if hint.active {
+		stateDB.setSenderHint(sender, hint.nonce, &hint.balanceCheck)
+	}
 }
 
 func newOCCSpeculativeRunner(e *Executor, req PreparedBlock) occSpeculativeRunner {
@@ -73,6 +123,7 @@ func (e *Executor) executeBlockOCC(ctx context.Context, req PreparedBlock, sourc
 // snapshot in parallel, then validates and reruns conflicts in index order.
 func (e *Executor) executeBlockOCCSnapshot(ctx context.Context, req PreparedBlock, source StateReader) (*BlockResult, error) {
 	runner := newOCCSpeculativeRunner(e, req)
+	runner.prepareSenderHints(source)
 	workers := min(e.cfg.OCCWorkers, len(req.Txs))
 	executionPool := e.occPool
 
@@ -86,11 +137,13 @@ func (e *Executor) executeBlockOCCSnapshot(ctx context.Context, req PreparedBloc
 	}
 
 	results, finalState, validation, err := e.validateBlockSTM(ctx, runner, executionPool, source, results)
-	if errors.Is(err, errOCCMaxIncarnation) || errors.Is(err, errOCCWorkerPoolClosed) {
+	if errors.Is(err, errOCCMaxIncarnation) || errors.Is(err, errOCCWorkerPoolClosed) || errors.Is(err, errOCCNonceHint) {
 		reason := validation.fallbackReason
 		switch {
 		case errors.Is(err, errOCCWorkerPoolClosed):
 			reason = occFallbackReasonWorkerPoolClosed
+		case errors.Is(err, errOCCNonceHint):
+			reason = occFallbackReasonNonceHint
 		case errors.Is(err, errOCCMaxIncarnation) && reason == "":
 			reason = occFallbackReasonMaxIncarnation
 		}
@@ -136,6 +189,7 @@ func (r occSpeculativeRunner) executeTx(
 		r.blockCtx,
 		r.baseFee,
 		gasLimit,
+		r.senderHint(txIndex),
 	)
 }
 
@@ -243,6 +297,7 @@ func (e *Executor) executeTxSpeculative(
 	blockCtx vm.BlockContext,
 	baseFee *big.Int,
 	gasLimit uint64,
+	hint senderHintSpec,
 ) (occTxExecution, error) {
 	if err := ctx.Err(); err != nil {
 		return occTxExecution{}, err
@@ -251,6 +306,7 @@ func (e *Executor) executeTxSpeculative(
 	stateDB := e.acquireStateDB(source)
 	defer e.releaseStateDB(stateDB)
 	stateDB.enableAccessTracking()
+	applySenderHint(stateDB, p.Sender, hint)
 	evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vm.Config{}, nil)
 	stateDB.SetEVM(evm)
 	gasPool := new(core.GasPool).AddGas(gasLimit)
@@ -264,12 +320,13 @@ func (e *Executor) executeTxSpeculative(
 		txIndexUint,
 		baseFee,
 	)
-	readSet, writeSet, shapes := stateDB.takeAccessSets()
+	readSet, writeSet, shapes, guards := stateDB.takeAccessSets()
 	result := occTxExecution{
 		txResult:                 txResult,
 		receipt:                  receipt,
 		readSet:                  readSet,
 		accountShapes:            shapes,
+		balanceGuards:            guards,
 		writeSet:                 writeSet,
 		gasUsed:                  txResult.GasUsed,
 		gasLimit:                 p.Tx.Gas(),
@@ -367,6 +424,12 @@ func validateBlockSTMFrontier(
 			validation.fallbackReason = occFallbackReasonGasOverflow
 			return nil, errors.New(occFallbackReasonGasOverflow)
 		}
+		if hint := runner.senderHint(txIndex); hint.active && state.prefix.GetNonce(runner.req.Txs[txIndex].Sender) != hint.nonce {
+			// The predicted nonce was wrong: some other transaction changed this
+			// sender's nonce. Re-execute the block without predictions.
+			validation.fallbackReason = occFallbackReasonNonceHint
+			return nil, errOCCNonceHint
+		}
 		state.cumulativeGasUsed += result.gasUsed
 		state.prefix.apply(result)
 		state.writes.addAllAt(txIndex, result.writeSet)
@@ -436,7 +499,10 @@ func availableGas(gasLimit uint64, cumulativeGasUsed uint64) uint64 {
 
 const occMaxTxIncarnations = 10
 
-var errOCCMaxIncarnation = errors.New("occ max incarnation reached")
+var (
+	errOCCMaxIncarnation = errors.New("occ max incarnation reached")
+	errOCCNonceHint      = errors.New("occ sender nonce prediction failed")
+)
 
 type occExecutionTask struct {
 	txIndex      int
@@ -470,6 +536,7 @@ const (
 	occFallbackReasonGasOverflow      = "gas_overflow"
 	occFallbackReasonMaxIncarnation   = "max_incarnation"
 	occFallbackReasonWorkerPoolClosed = "worker_pool_closed"
+	occFallbackReasonNonceHint        = "nonce_hint"
 )
 
 func validateSTMResultAgainstPrefix(
@@ -486,7 +553,8 @@ func validateSTMResultAgainstPrefix(
 	}
 	conflictsBefore := validation.conflictCount
 	validation.addReadConflicts(writes, result.readSet, result.accountShapes, prefix, sourcePrefix)
-	validation.addConflicts("write", writes, result.writeSet, sourcePrefix)
+	validation.addGuardConflicts(writes, result.balanceGuards, prefix, sourcePrefix)
+	validation.addWriteConflicts(writes, result.writeSet, sourcePrefix)
 	if validation.conflictCount == conflictsBefore {
 		return true
 	}
@@ -506,12 +574,16 @@ func stmGasValidationError(validation *occValidationResult, result occTxExecutio
 	return nil
 }
 
-func (r *occValidationResult) addConflicts(access string, writes *stateAccessIndex, set map[stateAccessKey]struct{}, sourcePrefix int) {
+// addWriteConflicts checks the write set against writes of transactions above
+// the source prefix. A nonce write is skipped: it is always derived from a nonce
+// read of the same account, and that read (exact, or predicted and verified at
+// finalisation) already covers it.
+func (r *occValidationResult) addWriteConflicts(writes *stateAccessIndex, set map[stateAccessKey]struct{}, sourcePrefix int) {
 	for key := range set {
-		if !writes.conflictsWithAfter(key, sourcePrefix) {
+		if key.kind == stateAccessNonce || !writes.conflictsWithAfter(key, sourcePrefix) {
 			continue
 		}
-		r.recordConflict(access, key)
+		r.recordConflict("write", key)
 	}
 }
 
@@ -533,6 +605,25 @@ func (r *occValidationResult) addReadConflicts(writes *stateAccessIndex, set map
 			continue
 		}
 		r.recordConflict("read", key)
+	}
+}
+
+// addGuardConflicts checks balance guards: the prefix must hold at least the
+// starting balance the transaction relied on. Without a prefix a guard is
+// treated as an exact balance read.
+func (r *occValidationResult) addGuardConflicts(writes *stateAccessIndex, guards map[common.Address]*uint256.Int, prefix StateReader, sourcePrefix int) {
+	for addr, lo := range guards {
+		key := stateAccessKey{kind: stateAccessBalance, address: addr}
+		if prefix == nil {
+			if writes.conflictsWithAfter(key, sourcePrefix) {
+				r.recordConflict("read", key)
+			}
+			continue
+		}
+		have, err := uint256FromBig(prefix.GetBalance(addr))
+		if err != nil || have.Cmp(lo) < 0 {
+			r.recordConflict("read", key)
+		}
 	}
 }
 

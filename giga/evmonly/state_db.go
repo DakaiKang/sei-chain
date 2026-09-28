@@ -41,6 +41,9 @@ type nativeStateDB struct {
 	txStorageWrites          map[common.Address]map[common.Hash]struct{}
 	txStorageClears          map[common.Address]struct{}
 	commutativeBalanceDeltas map[common.Address]*uint256.Int
+	commutativeBalanceDebits map[common.Address]*uint256.Int
+	balanceGuards            map[common.Address]*uint256.Int
+	senderHint               senderHint
 	journal                  []nativeJournalEntry
 	snapshots                []nativeSnapshot
 	readSet                  map[stateAccessKey]struct{}
@@ -90,6 +93,7 @@ const (
 	nativeJournalTxStorageWrite
 	nativeJournalTxStorageClear
 	nativeJournalCommutativeBalanceDelta
+	nativeJournalCommutativeBalanceDebit
 	nativeJournalPreimage
 	nativeJournalStorage
 	nativeJournalStorageMap
@@ -199,6 +203,9 @@ func (s *nativeStateDB) reset(source StateReader) {
 	}
 	clearAddressSet(&s.txStorageClears)
 	clearUint256Map(&s.commutativeBalanceDeltas)
+	clearUint256Map(&s.commutativeBalanceDebits)
+	clearUint256Map(&s.balanceGuards)
+	s.senderHint = senderHint{}
 	if s.journal != nil {
 		clear(s.journal)
 		s.journal = s.journal[:0]
@@ -243,8 +250,9 @@ func (s *nativeStateDB) ChangeSetInto(changes *StateChangeSet) {
 		acct := s.accounts[addr]
 		base := s.baseAccount(addr)
 
-		_, hasCommutativeDelta := s.commutativeBalanceDeltas[addr]
-		if !acct.Balance.Eq(base.Balance) || hasCommutativeDelta {
+		_, hasCommutativeCredit := s.commutativeBalanceDeltas[addr]
+		_, hasCommutativeDebit := s.commutativeBalanceDebits[addr]
+		if !acct.Balance.Eq(base.Balance) || hasCommutativeCredit || hasCommutativeDebit {
 			changes.Balances = append(changes.Balances, BalanceChange{
 				Address: addr,
 				Balance: acct.Balance.ToBig(),
@@ -313,6 +321,9 @@ func (s *nativeStateDB) CreateContract(addr common.Address) {
 }
 
 func (s *nativeStateDB) SubBalance(addr common.Address, amount *uint256.Int, _ tracing.BalanceChangeReason) uint256.Int {
+	if s.senderHint.guards(addr) {
+		return s.subBalanceGuarded(addr, amount)
+	}
 	prev := *s.GetBalance(addr)
 	if amount == nil || amount.IsZero() {
 		return prev
@@ -358,18 +369,35 @@ func (s *nativeStateDB) addCommutativeBalance(addr common.Address, amount *uint2
 	return prev
 }
 
+// commutativeBalanceDeltasBig returns each address's net commutative balance
+// change: credits minus guarded debits. Values may be negative.
 func (s *nativeStateDB) commutativeBalanceDeltasBig() map[common.Address]*big.Int {
-	if len(s.commutativeBalanceDeltas) == 0 {
+	if len(s.commutativeBalanceDeltas) == 0 && len(s.commutativeBalanceDebits) == 0 {
 		return nil
 	}
-	deltas := make(map[common.Address]*big.Int, len(s.commutativeBalanceDeltas))
+	deltas := make(map[common.Address]*big.Int, len(s.commutativeBalanceDeltas)+len(s.commutativeBalanceDebits))
 	for addr, delta := range s.commutativeBalanceDeltas {
 		deltas[addr] = delta.ToBig()
+	}
+	for addr, debit := range s.commutativeBalanceDebits {
+		net, ok := deltas[addr]
+		if !ok {
+			net = new(big.Int)
+			deltas[addr] = net
+		}
+		net.Sub(net, debit.ToBig())
 	}
 	return deltas
 }
 
 func (s *nativeStateDB) GetBalance(addr common.Address) *uint256.Int {
+	if s.senderHint.guards(addr) {
+		// A pre-execution comparison against the sender's balance. Its outcome is
+		// learned from the SubBalance that follows and recorded as a guard on the
+		// starting balance instead of a read of its value.
+		s.senderHint.guardPending = true
+		return s.account(addr).Balance.Clone()
+	}
 	s.markRead(stateAccessKey{kind: stateAccessBalance, address: addr})
 	return s.account(addr).Balance.Clone()
 }
@@ -386,6 +414,11 @@ func (s *nativeStateDB) SetBalance(addr common.Address, balance *uint256.Int, _ 
 }
 
 func (s *nativeStateDB) GetNonce(addr common.Address) uint64 {
+	if s.senderHint.active && addr == s.senderHint.addr {
+		// The sender's nonce is predicted from the block order (see senderHint)
+		// and verified when the block is finalised, so it is not a read.
+		return s.account(addr).Nonce
+	}
 	s.markRead(stateAccessKey{kind: stateAccessNonce, address: addr})
 	return s.account(addr).Nonce
 }
@@ -393,7 +426,15 @@ func (s *nativeStateDB) GetNonce(addr common.Address) uint64 {
 func (s *nativeStateDB) SetNonce(addr common.Address, nonce uint64, _ tracing.NonceChangeReason) {
 	acct := s.account(addr)
 	s.recordAccount(addr)
-	s.markWrite(stateAccessKey{kind: stateAccessNonce, address: addr})
+	key := stateAccessKey{kind: stateAccessNonce, address: addr}
+	if s.senderHint.active && addr == s.senderHint.addr {
+		// The value replaced is the predicted nonce, which the engine verifies
+		// against the block order at finalisation; the write must not become a
+		// dependency on the transaction that produced the previous nonce.
+		s.recordWrite(key)
+	} else {
+		s.markWrite(key)
+	}
 	acct.Nonce = nonce
 }
 
@@ -728,6 +769,9 @@ func (s *nativeStateDB) Copy() vm.StateDB {
 		txStorageWrites:          cloneStorageWriteSet(s.txStorageWrites),
 		txStorageClears:          cloneAddressSet(s.txStorageClears),
 		commutativeBalanceDeltas: cloneUint256Map(s.commutativeBalanceDeltas),
+		commutativeBalanceDebits: cloneUint256Map(s.commutativeBalanceDebits),
+		balanceGuards:            cloneUint256Map(s.balanceGuards),
+		senderHint:               s.senderHint,
 		journal:                  cloneJournal(s.journal),
 		snapshots:                cloneSnapshots(s.snapshots),
 		readSet:                  cloneAccessSet(s.readSet),
@@ -786,11 +830,17 @@ func (s *nativeStateDB) enableAccessTracking() {
 // takeAccessSets hands the read set, write set and the shapes observed by
 // account reads to the caller and stops tracking; enableAccessTracking must be
 // called again before further accesses are recorded.
-func (s *nativeStateDB) takeAccessSets() (map[stateAccessKey]struct{}, map[stateAccessKey]struct{}, map[common.Address]accountShape) {
-	readSet, writeSet, shapes := s.readSet, s.writeSet, s.shapeReads
+func (s *nativeStateDB) takeAccessSets() (map[stateAccessKey]struct{}, map[stateAccessKey]struct{}, map[common.Address]accountShape, map[common.Address]*uint256.Int) {
+	if s.senderHint.guardPending {
+		// A guarded balance comparison whose outcome never became a guard (the
+		// transaction failed before debiting): fall back to an exact read.
+		s.senderHint.guardPending = false
+		s.markRead(stateAccessKey{kind: stateAccessBalance, address: s.senderHint.addr})
+	}
+	readSet, writeSet, shapes, guards := s.readSet, s.writeSet, s.shapeReads, s.balanceGuards
 	s.lastReadSetSize, s.lastWriteSetSize = len(readSet), len(writeSet)
-	s.readSet, s.writeSet, s.shapeReads = nil, nil, nil
-	return readSet, writeSet, shapes
+	s.readSet, s.writeSet, s.shapeReads, s.balanceGuards = nil, nil, nil, nil
+	return readSet, writeSet, shapes, guards
 }
 
 func (s *nativeStateDB) markRead(key stateAccessKey) {
@@ -808,11 +858,16 @@ func (s *nativeStateDB) markRead(key stateAccessKey) {
 }
 
 func (s *nativeStateDB) markWrite(key stateAccessKey) {
-	if s.writeSet != nil {
-		s.writeSet[key] = struct{}{}
-	}
+	s.recordWrite(key)
 	if s.readObserver != nil {
 		s.readObserver.observeWrite(key)
+	}
+}
+
+// recordWrite adds a key to the write set without notifying the read observer.
+func (s *nativeStateDB) recordWrite(key stateAccessKey) {
+	if s.writeSet != nil {
+		s.writeSet[key] = struct{}{}
 	}
 }
 
@@ -885,6 +940,19 @@ func (e nativeJournalEntry) revert(s *nativeStateDB) {
 			}
 		} else {
 			delete(s.commutativeBalanceDeltas, e.address)
+		}
+	case nativeJournalCommutativeBalanceDebit:
+		if e.hadValue {
+			if s.commutativeBalanceDebits == nil {
+				s.commutativeBalanceDebits = map[common.Address]*uint256.Int{}
+			}
+			if e.balanceDelta == nil {
+				s.commutativeBalanceDebits[e.address] = uint256.NewInt(0)
+			} else {
+				s.commutativeBalanceDebits[e.address] = e.balanceDelta.Clone()
+			}
+		} else {
+			delete(s.commutativeBalanceDebits, e.address)
 		}
 	case nativeJournalPreimage:
 		if e.hadValue {
@@ -1177,6 +1245,9 @@ func (s *nativeStateDB) loadAccount(addr common.Address) *nativeAccount {
 		Code:    cloneBytes(s.source.GetCode(addr)),
 		Storage: map[common.Hash]storageValue{},
 	}
+	if s.senderHint.active && addr == s.senderHint.addr {
+		acct.Nonce = s.senderHint.nonce
+	}
 	return acct
 }
 
@@ -1468,4 +1539,113 @@ func uint256FromBig(v *big.Int) (*uint256.Int, error) {
 		return uint256.NewInt(0), nil
 	}
 	return u, nil
+}
+
+// senderHint lets a transaction's own sender be handled without exact reads.
+// The nonce is predicted from the block order (the snapshot nonce plus the
+// number of earlier transactions from the same sender) and verified when the
+// block is finalised. Until the top-level transfer completes, balance reads are
+// pre-execution comparisons whose outcome is recorded as a guard on the
+// starting balance, and debits are commutative deltas, so a sender's
+// transactions do not depend on each other's exact balance.
+type senderHint struct {
+	active       bool
+	addr         common.Address
+	nonce        uint64
+	balanceCheck uint256.Int // geth's BuyGas requirement: gasLimit*feeCap + value
+	phase        bool        // pre-execution phase: guarded balance handling is on
+	guardPending bool        // a guarded comparison awaits its SubBalance to become a guard
+}
+
+func (h *senderHint) guards(addr common.Address) bool {
+	return h.active && h.phase && addr == h.addr
+}
+
+func (s *nativeStateDB) setSenderHint(addr common.Address, nonce uint64, balanceCheck *uint256.Int) {
+	s.senderHint = senderHint{active: true, addr: addr, nonce: nonce, phase: true}
+	if balanceCheck != nil {
+		s.senderHint.balanceCheck = *balanceCheck
+	}
+}
+
+// endSenderPhase ends guarded balance handling; it runs when the top-level
+// transfer has completed, before any contract code executes.
+func (s *nativeStateDB) endSenderPhase() {
+	s.senderHint.phase = false
+}
+
+// subBalanceGuarded debits the hinted sender during the pre-execution phase. A
+// passing check becomes a guard: the starting balance must be at least the
+// amount required at this point, or geth's BuyGas requirement if that is what
+// the preceding comparison tested. A failing check records an exact read so
+// validation catches funds arriving from a lower transaction.
+func (s *nativeStateDB) subBalanceGuarded(addr common.Address, amount *uint256.Int) uint256.Int {
+	acct := s.account(addr)
+	prev := *acct.Balance.Clone()
+	if amount != nil && acct.Balance.Cmp(amount) < 0 {
+		s.err = errInsufficientBalance
+		s.senderHint.guardPending = false
+		s.markRead(stateAccessKey{kind: stateAccessBalance, address: addr})
+		return prev
+	}
+	threshold := new(uint256.Int)
+	if amount != nil {
+		threshold.Set(amount)
+	}
+	// Express the requirement on the starting balance: debits so far raise it,
+	// credits so far lower it.
+	if debits, ok := s.commutativeBalanceDebits[addr]; ok {
+		threshold.Add(threshold, debits)
+	}
+	if credits, ok := s.commutativeBalanceDeltas[addr]; ok {
+		if threshold.Cmp(credits) <= 0 {
+			threshold.Clear()
+		} else {
+			threshold.Sub(threshold, credits)
+		}
+	}
+	if s.senderHint.guardPending {
+		s.senderHint.guardPending = false
+		if s.senderHint.balanceCheck.Cmp(threshold) > 0 {
+			threshold.Set(&s.senderHint.balanceCheck)
+		}
+	}
+	if s.balanceGuards == nil {
+		s.balanceGuards = map[common.Address]*uint256.Int{}
+	}
+	if lo, ok := s.balanceGuards[addr]; !ok || lo.Cmp(threshold) < 0 {
+		s.balanceGuards[addr] = threshold
+	}
+	if amount == nil || amount.IsZero() {
+		return prev
+	}
+	s.recordAccount(addr)
+	acct.Balance.Sub(acct.Balance, amount)
+	s.recordCommutativeBalanceDebit(addr)
+	if s.commutativeBalanceDebits == nil {
+		s.commutativeBalanceDebits = map[common.Address]*uint256.Int{}
+	}
+	debit, ok := s.commutativeBalanceDebits[addr]
+	if !ok {
+		debit = uint256.NewInt(0)
+		s.commutativeBalanceDebits[addr] = debit
+	}
+	debit.Add(debit, amount)
+	return prev
+}
+
+func (s *nativeStateDB) recordCommutativeBalanceDebit(addr common.Address) {
+	if len(s.snapshots) == 0 {
+		return
+	}
+	debit, ok := s.commutativeBalanceDebits[addr]
+	entry := nativeJournalEntry{
+		kind:     nativeJournalCommutativeBalanceDebit,
+		address:  addr,
+		hadValue: ok,
+	}
+	if ok && debit != nil {
+		entry.balanceDelta = debit.Clone()
+	}
+	s.journal = append(s.journal, entry)
 }

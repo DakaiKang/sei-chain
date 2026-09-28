@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 // mvEstimateAbort is raised (as a panic inside the StateDB callbacks, then
@@ -195,11 +196,20 @@ func (r *mvVersionedReader) GetState(addr common.Address, slot common.Hash) comm
 
 // collect returns the reads validation must check: every key the transaction
 // needed that was resolved from multi-version memory or the snapshot.
-func (r *mvVersionedReader) collect() []mvRead {
-	reads := make([]mvRead, 0, len(r.needed)+len(r.shapeNeeded))
+func (r *mvVersionedReader) collect(guards map[common.Address]*uint256.Int) []mvRead {
+	reads := make([]mvRead, 0, len(r.needed)+len(r.shapeNeeded)+len(guards))
 	for key := range r.needed {
 		if rd, ok := r.resolved[key]; ok {
 			reads = append(reads, *rd)
+		}
+	}
+	for addr, lo := range guards {
+		key := stateAccessKey{kind: stateAccessBalance, address: addr}
+		if _, exact := r.needed[key]; exact {
+			continue // an exact read subsumes the guard
+		}
+		if _, resolved := r.resolved[key]; resolved {
+			reads = append(reads, mvRead{key: key, guard: true, u256: *lo})
 		}
 	}
 	for addr := range r.shapeNeeded {
@@ -279,6 +289,7 @@ func (e *Executor) executeIncarnation(
 	blockCtx vm.BlockContext,
 	baseFee *big.Int,
 	gasLimit uint64,
+	hint senderHintSpec,
 ) (result occTxExecution, err error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return occTxExecution{}, ctxErr
@@ -298,6 +309,7 @@ func (e *Executor) executeIncarnation(
 	stateDB := e.acquireStateDB(reader)
 	defer e.releaseStateDB(stateDB)
 	stateDB.enableAccessTracking()
+	applySenderHint(stateDB, p.Sender, hint)
 	evm := vm.NewEVM(blockCtx, stateDB, chainConfig, vm.Config{}, nil)
 	stateDB.SetEVM(evm)
 	gasPool := new(core.GasPool).AddGas(gasLimit)
@@ -311,11 +323,11 @@ func (e *Executor) executeIncarnation(
 		txIdxUint,
 		baseFee,
 	)
-	_, writeSet, _ := stateDB.takeAccessSets()
+	_, writeSet, _, guards := stateDB.takeAccessSets()
 	result = occTxExecution{
 		txResult:                 txResult,
 		receipt:                  receipt,
-		reads:                    reader.collect(),
+		reads:                    reader.collect(guards),
 		writeSet:                 writeSet,
 		gasUsed:                  txResult.GasUsed,
 		gasLimit:                 p.Tx.Gas(),

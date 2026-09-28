@@ -107,9 +107,9 @@ func TestTransferWorkloadOCCScenarios(t *testing.T) {
 			wantSameRecipient: true,
 		},
 		{
+			// Predicted nonces and guarded gas balances make the chain conflict-free.
 			name:           "same sender nonce chain",
 			args:           []string{"--same-sender"},
-			wantReruns:     true,
 			wantSameSender: true,
 		},
 	}
