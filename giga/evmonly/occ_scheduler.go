@@ -18,6 +18,12 @@ import (
 // final once it passed validation in a wave at least as new as every rewind at
 // or below its index; the commit cursor advances over final transactions in
 // order and lets multi-version memory materialise their writes.
+//
+// Validation never runs ahead of the executed frontier, the lowest index whose
+// current incarnation has not finished executing. A validation of a
+// transaction with an unfinished lower transaction would be repeated once that
+// transaction publishes, so it is not dispatched until then; in a block without
+// conflicts every transaction is validated exactly once.
 
 type occTxStatus uint8
 
@@ -76,6 +82,10 @@ type occScheduler struct {
 	numValidated  atomic.Int64
 	done          atomic.Bool
 	txs           []occTxSlot
+	// executedFrontier is the lowest index whose current incarnation has not
+	// finished executing (n when all have). It advances in finishExecution and
+	// retreats when a transaction is aborted.
+	executedFrontier atomic.Int64
 	// commitIdx is the next transaction to commit; commitMu serialises the
 	// cursor's advance. commitWave is the newest wave of any rewind that
 	// targeted a committed index; it is written under commitMu and read
@@ -194,8 +204,28 @@ func (s *occScheduler) nextToExecute() occTask {
 	return s.tryIncarnate(idx)
 }
 
+// advanceExecutedFrontier moves the frontier over transactions that have
+// finished their current incarnation.
+func (s *occScheduler) advanceExecutedFrontier() {
+	for {
+		f := int(s.executedFrontier.Load())
+		if f >= s.n {
+			return
+		}
+		slot := &s.txs[f]
+		slot.mu.Lock()
+		executed := slot.status == occTxExecuted || slot.status == occTxValidated
+		slot.mu.Unlock()
+		if !executed || !s.executedFrontier.CompareAndSwap(int64(f), int64(f+1)) {
+			if !executed {
+				return
+			}
+		}
+	}
+}
+
 func (s *occScheduler) nextToValidate() occTask {
-	if s.validationIndex() >= s.n {
+	if idx := s.validationIndex(); idx >= s.n || int64(idx) >= s.executedFrontier.Load() {
 		return occTask{}
 	}
 	s.numActive.Add(1)
@@ -224,13 +254,19 @@ func (s *occScheduler) nextTask() occTask {
 			return occTask{}
 		}
 		var task occTask
-		if valIdx < execIdx {
+		if valIdx < execIdx && int64(valIdx) < s.executedFrontier.Load() {
 			task = s.nextToValidate()
-		} else {
+		}
+		if task.kind == occTaskNone {
 			task = s.nextToExecute()
 		}
 		if task.kind != occTaskNone {
 			return task
+		}
+		if execIdx >= s.n {
+			// Everything is dispatched and validation waits for an execution in
+			// flight: nothing to hand out until it finishes.
+			return occTask{}
 		}
 	}
 	return occTask{}
@@ -267,6 +303,7 @@ func (s *occScheduler) finishExecution(txIdx, incarnation int, wroteNewLocation 
 	deps := slot.dependents
 	slot.dependents = nil
 	slot.mu.Unlock()
+	s.advanceExecutedFrontier()
 
 	if len(deps) > 0 {
 		minDep := -1
@@ -314,6 +351,7 @@ func (s *occScheduler) tryValidationAbort(txIdx, incarnation int) bool {
 		return false
 	}
 	slot.status = occTxAborting
+	fetchMin(&s.executedFrontier, int64(txIdx))
 	return true
 }
 

@@ -219,8 +219,8 @@ func TestOCCSchedulerConcurrentTermination(t *testing.T) {
 }
 
 // TestOCCSchedulerCommitCursorWaves: a transaction validated before a lower
-// transaction rewound validation is not final until it is validated again in
-// the newer wave.
+// transaction was re-executed is not final until it is validated again in the
+// wave that re-execution started.
 func TestOCCSchedulerCommitCursorWaves(t *testing.T) {
 	s := newOCCScheduler(2)
 	var committed []int
@@ -228,35 +228,75 @@ func TestOCCSchedulerCommitCursorWaves(t *testing.T) {
 
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0}, s.nextTask())
 	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 1}, s.nextTask())
-	// tx1 finishes first. The validation index has not passed 1, so no wave
-	// starts; the sweep skips the executing tx0 and validates tx1 in wave 0.
 	require.Equal(t, occTask{}, s.finishExecution(1, 0, true))
-	task := s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 0}, task)
-	_, err := s.finishValidation(1, 0, false, task.wave)
-	require.NoError(t, err)
-	s.tryCommit(commit)
-	require.Empty(t, committed, "tx0 is not validated yet")
-
-	// tx0 finishes and rewinds validation from 2 to 0, starting wave 1. tx1's
-	// wave-0 validation predates tx0's writes and is stale.
+	require.Equal(t, occTask{}, s.nextTask(), "validation waits for tx0, which is still executing")
 	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
-	task = s.nextTask()
+	for idx := range 2 {
+		task := s.nextTask()
+		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx, wave: 0}, task, "no rewind happened: wave 0")
+		_, err := s.finishValidation(idx, 0, false, task.wave)
+		require.NoError(t, err)
+	}
+
+	// tx0 is invalidated by a late re-validation and re-executes: tx1's wave-0
+	// validation predates tx0's new writes.
+	s.decreaseValidationIdx(0)
+	task := s.nextTask()
 	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: 1}, task)
-	_, err = s.finishValidation(0, 0, false, task.wave)
+	require.True(t, s.tryValidationAbort(0, 0))
+	task, err := s.finishValidation(0, 0, true, task.wave)
+	require.NoError(t, err)
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0, incarnation: 1}, task)
+	s.tryCommit(commit)
+	require.Empty(t, committed, "tx0 is being re-executed")
+	require.Equal(t, occTask{}, s.nextTask(), "tx1 is not re-validated while tx0 executes")
+
+	require.Equal(t, occTask{}, s.finishExecution(0, 1, true))
+	task = s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, incarnation: 1, wave: 2}, task)
+	_, err = s.finishValidation(0, 1, false, task.wave)
 	require.NoError(t, err)
 	s.tryCommit(commit)
-	require.Equal(t, []int{0}, committed, "tx0 is final; tx1 must be re-validated in wave 1")
+	require.Equal(t, []int{0}, committed, "tx0 is final; tx1's wave-0 validation is stale")
 	require.True(t, s.isCommitted(0))
 	require.False(t, s.isCommitted(1))
 
 	task = s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 1}, task)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 2}, task)
 	_, err = s.finishValidation(1, 0, false, task.wave)
 	require.NoError(t, err)
 	s.tryCommit(commit)
 	require.Equal(t, []int{0, 1}, committed)
 	require.False(t, s.tryValidationAbort(1, 0), "a committed transaction cannot be aborted")
+	require.True(t, s.isDone())
+	require.True(t, s.allValidated())
+}
+
+// TestOCCSchedulerValidationWaitsForExecutedFrontier: with two workers, the
+// higher transaction finishing first is not validated until the lower one
+// has executed, so a conflict-free block validates each transaction once.
+func TestOCCSchedulerValidationWaitsForExecutedFrontier(t *testing.T) {
+	s := newOCCScheduler(3)
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 0}, s.nextTask())
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 1}, s.nextTask())
+	require.Equal(t, occTask{}, s.finishExecution(1, 0, true))
+	require.Equal(t, occTask{kind: occTaskExecute, txIdx: 2}, s.nextTask(), "execution continues while validation waits")
+	require.Equal(t, occTask{}, s.finishExecution(2, 0, true))
+	require.Equal(t, occTask{}, s.nextTask())
+	require.False(t, s.isDone())
+	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
+	validations := 0
+	for {
+		task := s.nextTask()
+		if task.kind == occTaskNone {
+			break
+		}
+		require.Equal(t, occTaskValidate, task.kind)
+		validations++
+		_, err := s.finishValidation(task.txIdx, task.incarnation, false, task.wave)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 3, validations)
 	require.True(t, s.isDone())
 	require.True(t, s.allValidated())
 }
