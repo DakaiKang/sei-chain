@@ -107,6 +107,12 @@ func unpackValidationIdx(v int64) (int, int64) {
 	return int(v & 0xffffffff), v >> 32
 }
 
+// validationWave returns the wave validations dispatched now run in.
+func (s *occScheduler) validationWave() int64 {
+	_, wave := unpackValidationIdx(s.validationIdx.Load())
+	return wave
+}
+
 // validationIndex returns the next index to validate.
 func (s *occScheduler) validationIndex() int {
 	idx, _ := unpackValidationIdx(s.validationIdx.Load())
@@ -127,19 +133,24 @@ func (s *occScheduler) decreaseExecutionIdx(target int) {
 	s.decreaseCnt.Add(1)
 }
 
-// decreaseValidationIdx rewinds validation to target, starting a new wave when
-// it actually moves the index, and returns the wave validations of target and
-// above now run in.
+// decreaseValidationIdx declares that every transaction from target upwards
+// must be validated again, and returns the wave those validations now run in.
+//
+// A new wave starts whether or not the index moves. The index only has to move
+// when validation has already passed target; the wave, though, is what tells
+// the commit cursor that a validation taken before this call no longer counts,
+// and a transaction above target can be holding one of those from an earlier
+// sweep even while the index sits below target.
 func (s *occScheduler) decreaseValidationIdx(target int) int64 {
 	for {
 		cur := s.validationIdx.Load()
 		idx, wave := unpackValidationIdx(cur)
-		if idx <= target {
-			s.decreaseCnt.Add(1)
-			return wave
-		}
 		next := wave + 1
-		if s.validationIdx.CompareAndSwap(cur, packValidationIdx(target, next)) {
+		rewound := idx
+		if idx > target {
+			rewound = target
+		}
+		if s.validationIdx.CompareAndSwap(cur, packValidationIdx(rewound, next)) {
 			if target < s.n {
 				slot := &s.txs[target]
 				slot.mu.Lock()
@@ -206,6 +217,12 @@ func (s *occScheduler) nextToExecute() occTask {
 
 // advanceExecutedFrontier moves the frontier over transactions that have
 // finished their current incarnation.
+//
+// The move happens under the slot's own lock, which tryValidationAbort also
+// holds while it marks the transaction aborting and pulls the frontier back.
+// Reading the status and then moving the frontier outside that lock would let
+// an abort land in between, leaving the frontier past a transaction that is
+// re-executing and releasing validations that have to run again anyway.
 func (s *occScheduler) advanceExecutedFrontier() {
 	for {
 		f := int(s.executedFrontier.Load())
@@ -215,12 +232,12 @@ func (s *occScheduler) advanceExecutedFrontier() {
 		slot := &s.txs[f]
 		slot.mu.Lock()
 		executed := slot.status == occTxExecuted || slot.status == occTxValidated
+		moved := executed && s.executedFrontier.CompareAndSwap(int64(f), int64(f+1))
 		slot.mu.Unlock()
-		if !executed || !s.executedFrontier.CompareAndSwap(int64(f), int64(f+1)) {
-			if !executed {
-				return
-			}
+		if !executed {
+			return
 		}
+		_ = moved // a lost race simply re-reads the frontier
 	}
 }
 
@@ -319,12 +336,15 @@ func (s *occScheduler) finishExecution(txIdx, incarnation int, wroteNewLocation 
 		s.decreaseExecutionIdx(minDep)
 	}
 
-	if valIdx, wave := unpackValidationIdx(s.validationIdx.Load()); valIdx > txIdx {
-		if wroteNewLocation {
-			s.decreaseValidationIdx(txIdx)
-		} else {
-			return occTask{kind: occTaskValidate, txIdx: txIdx, incarnation: incarnation, wave: wave}
-		}
+	// New locations invalidate every validation taken above this transaction,
+	// including ones from an earlier sweep the index has since fallen below, so
+	// the wave advances even when the index does not have to move.
+	valIdx, wave := unpackValidationIdx(s.validationIdx.Load())
+	switch {
+	case wroteNewLocation:
+		s.decreaseValidationIdx(txIdx)
+	case valIdx > txIdx:
+		return occTask{kind: occTaskValidate, txIdx: txIdx, incarnation: incarnation, wave: wave}
 	}
 	s.numActive.Add(-1)
 	return occTask{}

@@ -14,6 +14,7 @@ const (
 	WorkloadERC20Transfer  = "erc20-transfer"
 	WorkloadSnapshotRevert = "snapshot-revert"
 	WorkloadStorageRW      = "storage-rw"
+	WorkloadDivergentRW    = "divergent-rw"
 
 	DefaultGenesisTimestamp = uint64(1_700_000_000)
 )
@@ -37,7 +38,18 @@ type Config struct {
 	StorageRecords int
 	// StorageOp is the operation each storage-rw transaction performs: rmw,
 	// read, or write.
-	StorageOp             string
+	StorageOp         string
+	DivergentContract common.Address
+	// DivergentFanout is the number of hot counter slots divergent-rw
+	// transactions share. A block of T transactions over F counters forms F
+	// chains of T/F.
+	DivergentFanout int
+	// DivergentTargetSpace is the number of distinct slots the derived writes
+	// spread over.
+	DivergentTargetSpace int
+	// DivergentOp selects the arm: divergent, whose written slot is derived
+	// during execution, or control, whose written slot comes from calldata.
+	DivergentOp           string
 	FixedRecipient        *common.Address
 	RecipientConflictRate float64
 	SameSender            bool
@@ -63,6 +75,8 @@ func NewWorkload(kind string, cfg Config, state State) (Workload, error) {
 		return NewSnapshotRevertWorkload(cfg, state), nil
 	case WorkloadStorageRW:
 		return NewStorageRWWorkload(cfg, state)
+	case WorkloadDivergentRW:
+		return NewDivergentRWWorkload(cfg, state)
 	default:
 		return nil, fmt.Errorf("unsupported workload %q", kind)
 	}

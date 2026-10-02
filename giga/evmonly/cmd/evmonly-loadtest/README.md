@@ -14,8 +14,10 @@ The synthetic workload defaults to local EVM chain ID `1337`; override it with
 It currently generates pure EVM legacy transfer transactions, ERC20 transfer
 transactions using `sei-load`'s compiled contract runtime, a contract-call
 workload that exercises nested StateDB
-snapshot/revert behavior, and a storage read/write workload whose transactions
-contend on a shared slot keyspace. By default, each generated sender account has one
+snapshot/revert behavior, a storage read/write workload whose transactions
+contend on a shared slot keyspace, and a divergent read/write workload whose
+transactions only learn which slot they write once they have read a counter a
+lower transaction is advancing. By default, each generated sender account has one
 nonce-0 transaction and is funded in generated genesis state. Non-balance
 genesis state is committed to FlatKV before the measured blocks run. Recipients
 are unique by default so the transfer workloads exercise the optimistic
@@ -205,6 +207,21 @@ Useful knobs:
   (load, add one, store; the default), `read`, or `write`.
 - `--storage-contract`: generated contract address used by
   `--workload=storage-rw`.
+- `--divergent-fanout`: the number of hot counter slots a `divergent-rw`
+  block's transactions share. A block of `T` transactions over `F` counters
+  forms `F` chains of `T/F`.
+- `--divergent-target-space`: the number of distinct slots the derived writes
+  spread over. A space small enough that wrong writes land on slots other
+  transactions touch is what turns a re-execution into a cascade.
+- `--divergent-op`: which arm to run. `divergent` derives the written slot
+  during execution, so a re-execution publishes a different write set than the
+  one it replaces. `control` reads the same counter and writes the same number
+  of slots, but takes the slot from calldata, so the write set is settled
+  before the transaction runs. The two arms are matched on gas and on how many
+  distinct slots they write per block, which leaves write-set instability as
+  the only difference between them.
+- `--divergent-contract`: generated contract address used by
+  `--workload=divergent-rw`.
 
 The command reports these saturation signals on stdout and at `/metrics`:
 

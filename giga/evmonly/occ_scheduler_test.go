@@ -87,8 +87,11 @@ func TestOCCSchedulerAbortWithNewLocationsRewindsValidation(t *testing.T) {
 	// A lower re-execution rewinds validation; the re-validation of tx0 then
 	// fails, rewinding validation to 1, and tx0's re-execution with new writes
 	// rewinds it to 0.
+	beforeRewind := s.validationWave()
 	s.decreaseValidationIdx(0)
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: 1}, s.nextTask(), "the rewind started wave 1")
+	task0 := s.nextTask()
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: task0.wave}, task0)
+	require.Greater(t, task0.wave, beforeRewind, "a rewind starts a new wave")
 	require.True(t, s.tryValidationAbort(0, 0))
 	require.False(t, s.allValidated())
 	task, err := s.finishValidation(0, 0, true, 0)
@@ -231,18 +234,20 @@ func TestOCCSchedulerCommitCursorWaves(t *testing.T) {
 	require.Equal(t, occTask{}, s.finishExecution(1, 0, true))
 	require.Equal(t, occTask{}, s.nextTask(), "validation waits for tx0, which is still executing")
 	require.Equal(t, occTask{}, s.finishExecution(0, 0, true))
+	firstWave := s.validationWave()
 	for idx := range 2 {
 		task := s.nextTask()
-		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx, wave: 0}, task, "no rewind happened: wave 0")
+		require.Equal(t, occTask{kind: occTaskValidate, txIdx: idx, wave: firstWave}, task)
 		_, err := s.finishValidation(idx, 0, false, task.wave)
 		require.NoError(t, err)
 	}
 
-	// tx0 is invalidated by a late re-validation and re-executes: tx1's wave-0
-	// validation predates tx0's new writes.
+	// tx0 is invalidated by a late re-validation and re-executes, so tx1's
+	// validation from the first wave predates tx0's new writes.
 	s.decreaseValidationIdx(0)
 	task := s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: 1}, task)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, wave: task.wave}, task)
+	require.Greater(t, task.wave, firstWave)
 	require.True(t, s.tryValidationAbort(0, 0))
 	task, err := s.finishValidation(0, 0, true, task.wave)
 	require.NoError(t, err)
@@ -253,16 +258,18 @@ func TestOCCSchedulerCommitCursorWaves(t *testing.T) {
 
 	require.Equal(t, occTask{}, s.finishExecution(0, 1, true))
 	task = s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, incarnation: 1, wave: 2}, task)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 0, incarnation: 1, wave: task.wave}, task)
+	reValidationWave := task.wave
+	require.Greater(t, reValidationWave, firstWave)
 	_, err = s.finishValidation(0, 1, false, task.wave)
 	require.NoError(t, err)
 	s.tryCommit(commit)
-	require.Equal(t, []int{0}, committed, "tx0 is final; tx1's wave-0 validation is stale")
+	require.Equal(t, []int{0}, committed, "tx0 is final; tx1's first-wave validation is stale")
 	require.True(t, s.isCommitted(0))
 	require.False(t, s.isCommitted(1))
 
 	task = s.nextTask()
-	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: 2}, task)
+	require.Equal(t, occTask{kind: occTaskValidate, txIdx: 1, wave: reValidationWave}, task)
 	_, err = s.finishValidation(1, 0, false, task.wave)
 	require.NoError(t, err)
 	s.tryCommit(commit)

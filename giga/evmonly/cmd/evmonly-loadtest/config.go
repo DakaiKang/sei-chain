@@ -33,6 +33,10 @@ const (
 	defaultStorageContract          = "0x00000000000000000000000000000000000057aa"
 	defaultStorageRecords           = 1_000
 	defaultStorageTxGasLimit        = 100_000
+	defaultDivergentContract        = "0x00000000000000000000000000000000000057bb"
+	defaultDivergentFanout          = 64
+	defaultDivergentTargetSpace     = 4_096
+	defaultDivergentTxGasLimit      = 150_000
 	defaultTxsPerBlock              = 1_000
 	defaultPersistBuffer            = 4 << 20
 	defaultGenesisTimestamp         = scenarios.DefaultGenesisTimestamp
@@ -42,6 +46,7 @@ const (
 	workloadERC20Transfer           = scenarios.WorkloadERC20Transfer
 	workloadSnapshotRevert          = scenarios.WorkloadSnapshotRevert
 	workloadStorageRW               = scenarios.WorkloadStorageRW
+	workloadDivergentRW             = scenarios.WorkloadDivergentRW
 	resultSinkDiscard               = "discard"
 	resultSinkFile                  = "file"
 	resultSinkChangeSet             = "changeset"
@@ -75,6 +80,10 @@ type config struct {
 	storageContract        common.Address
 	storageRecords         int
 	storageOp              string
+	divergentContract      common.Address
+	divergentFanout        int
+	divergentTargetSpace   int
+	divergentOp            string
 	chainID                *big.Int
 	gasPrice               *big.Int
 	minGasPrice            *big.Int
@@ -108,6 +117,10 @@ func scenarioConfig(cfg config) scenarios.Config {
 		StorageContract:        cfg.storageContract,
 		StorageRecords:         cfg.storageRecords,
 		StorageOp:              cfg.storageOp,
+		DivergentContract:      cfg.divergentContract,
+		DivergentFanout:        cfg.divergentFanout,
+		DivergentTargetSpace:   cfg.divergentTargetSpace,
+		DivergentOp:            cfg.divergentOp,
 		FixedRecipient:         cfg.fixedRecipient,
 		RecipientConflictRate:  cfg.recipientConflictRate,
 		SameSender:             cfg.sameSender,
@@ -141,6 +154,10 @@ func parseConfig(args []string) (config, error) {
 	storageContract := fs.String("storage-contract", defaultStorageContract, "EVM address for the generated storage-rw contract")
 	fs.IntVar(&cfg.storageRecords, "storage-records", defaultStorageRecords, "storage-rw: number of distinct slots shared by a block's transactions; fewer slots than txs-per-block makes the remainder contend")
 	fs.StringVar(&cfg.storageOp, "storage-op", scenarios.StorageOpRMW, "storage-rw: operation per transaction: rmw, read, or write")
+	divergentContract := fs.String("divergent-contract", defaultDivergentContract, "EVM address for the generated divergent-rw contract")
+	fs.IntVar(&cfg.divergentFanout, "divergent-fanout", defaultDivergentFanout, "divergent-rw: number of hot counter slots; a block's transactions split into this many chains")
+	fs.IntVar(&cfg.divergentTargetSpace, "divergent-target-space", defaultDivergentTargetSpace, "divergent-rw: number of distinct slots the derived writes spread over")
+	fs.StringVar(&cfg.divergentOp, "divergent-op", scenarios.DivergentOpDivergent, "divergent-rw: arm to run: divergent (slot derived during execution) or control (slot from calldata)")
 	recipient := fs.String("recipient", "", "optional fixed transfer recipient; empty creates one recipient per tx")
 	fs.Float64Var(&cfg.recipientConflictRate, "recipient-conflict-rate", 0, "fraction [0,1] of transactions per block paired onto shared recipients; 0 keeps recipients unique")
 	fs.BoolVar(&cfg.sameSender, "same-sender", false, "use one sender with sequential nonces for every transaction in a transfer block")
@@ -167,7 +184,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.cpuProfile, "cpu-profile", "", "write Go CPU profile to this file; starts after prebuild")
 	fs.StringVar(&cfg.heapProfile, "heap-profile", "", "write Go heap profile to this file after execution")
 	fs.StringVar(&cfg.traceProfile, "trace-profile", "", "write Go runtime trace to this file; starts after prebuild")
-	fs.StringVar(&cfg.workload, "workload", workloadTransfer, "workload type: transfer, erc20-transfer, snapshot-revert, or storage-rw")
+	fs.StringVar(&cfg.workload, "workload", workloadTransfer, "workload type: transfer, erc20-transfer, snapshot-revert, storage-rw, or divergent-rw")
 	fs.Uint64Var(&cfg.txGasLimit, "tx-gas-limit", defaultTxGasLimit, "gas limit for each generated transaction")
 	fs.Uint64Var(&cfg.blockGasLimit, "block-gas-limit", 0, "block gas limit; 0 lets the executor use its maximum")
 	fs.BoolVar(&cfg.disableGasPriceRule, "disable-gas-price-rule", false, "disable the executor min-gas-price validity rule")
@@ -219,7 +236,8 @@ func parseConfig(args []string) (config, error) {
 	cfg.snapshotRevertHelper = common.HexToAddress(*snapshotRevertHelper)
 	cfg.workload = strings.ToLower(strings.TrimSpace(cfg.workload))
 	if cfg.workload != workloadTransfer && cfg.workload != workloadERC20Transfer &&
-		cfg.workload != workloadSnapshotRevert && cfg.workload != workloadStorageRW {
+		cfg.workload != workloadSnapshotRevert && cfg.workload != workloadStorageRW &&
+		cfg.workload != workloadDivergentRW {
 		return config{}, fmt.Errorf("unsupported workload %q", cfg.workload)
 	}
 	if !common.IsHexAddress(*storageContract) {
@@ -227,6 +245,11 @@ func parseConfig(args []string) (config, error) {
 	}
 	cfg.storageContract = common.HexToAddress(*storageContract)
 	cfg.storageOp = strings.ToLower(strings.TrimSpace(cfg.storageOp))
+	if !common.IsHexAddress(*divergentContract) {
+		return config{}, fmt.Errorf("divergent-contract must be a hex EVM address")
+	}
+	cfg.divergentContract = common.HexToAddress(*divergentContract)
+	cfg.divergentOp = strings.ToLower(strings.TrimSpace(cfg.divergentOp))
 	txGasLimitSet := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "tx-gas-limit" {
@@ -241,6 +264,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if cfg.workload == workloadStorageRW && !txGasLimitSet {
 		cfg.txGasLimit = defaultStorageTxGasLimit
+	}
+	if cfg.workload == workloadDivergentRW && !txGasLimitSet {
+		cfg.txGasLimit = defaultDivergentTxGasLimit
 	}
 	if cfg.blocks == 0 {
 		return config{}, fmt.Errorf("blocks must be positive")
@@ -299,6 +325,23 @@ func parseConfig(args []string) (config, error) {
 		}
 		if cfg.recipientConflictRate != 0 {
 			return config{}, fmt.Errorf("recipient-conflict-rate is not supported with storage-rw workload")
+		}
+	}
+	if cfg.workload == workloadDivergentRW {
+		if cfg.divergentFanout <= 0 {
+			return config{}, fmt.Errorf("divergent-fanout must be positive")
+		}
+		if cfg.divergentTargetSpace <= 0 {
+			return config{}, fmt.Errorf("divergent-target-space must be positive")
+		}
+		if cfg.divergentOp != scenarios.DivergentOpDivergent && cfg.divergentOp != scenarios.DivergentOpControl {
+			return config{}, fmt.Errorf("unsupported divergent-op %q", cfg.divergentOp)
+		}
+		if cfg.fixedRecipient != nil {
+			return config{}, fmt.Errorf("recipient is not supported with divergent-rw workload")
+		}
+		if cfg.recipientConflictRate != 0 {
+			return config{}, fmt.Errorf("recipient-conflict-rate is not supported with divergent-rw workload")
 		}
 	}
 	if cfg.sameSender && cfg.workload != workloadTransfer {

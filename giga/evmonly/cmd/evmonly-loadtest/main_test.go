@@ -1175,3 +1175,54 @@ func TestStorageRWFlagsAreValidated(t *testing.T) {
 		})
 	}
 }
+
+// TestDivergentRWBlockSTMMatchesSequential drives the arm whose written slot is
+// only settled once the transaction has read a counter a lower transaction is
+// advancing, so a re-execution publishes a different write set than the one it
+// replaces. One chain over many workers makes that happen thousands of times in
+// a block.
+func TestDivergentRWBlockSTMMatchesSequential(t *testing.T) {
+	const (
+		txsPerBlock = 500
+		rounds      = 40
+		workers     = 8
+	)
+	run := func(t *testing.T, workers int, mode evmonly.OCCMode) *evmonly.BlockResult {
+		t.Helper()
+		cfg, err := parseConfig([]string{
+			"--metrics-addr=", "--blocks=1", "--workload=divergent-rw",
+			fmt.Sprintf("--txs-per-block=%d", txsPerBlock),
+			"--divergent-op=divergent", "--divergent-fanout=1", "--divergent-target-space=64",
+			"--gas-price-wei=0", "--min-gas-price-wei=0",
+		})
+		require.NoError(t, err)
+		state := newGeneratedState()
+		workload, err := scenarios.NewWorkload(cfg.workload, scenarioConfig(cfg), state)
+		require.NoError(t, err)
+		request, err := workload.BuildBlock(t.Context(), 1)
+		require.NoError(t, err)
+		executor := evmonly.NewExecutor(evmonly.Config{
+			MinGasPrice: cfg.minGasPrice,
+			OCCWorkers:  workers,
+			OCCMode:     mode,
+		}, withGeneratedState(state))
+		defer executor.Close()
+		result, err := executor.ExecuteBlock(t.Context(), request)
+		require.NoError(t, err)
+		return result
+	}
+
+	sequential := run(t, 1, evmonly.OCCModeBlockSTM)
+	require.False(t, sequential.OCCStats.Attempted)
+	defer sequential.Release()
+
+	for round := 0; round < rounds; round++ {
+		result := run(t, workers, evmonly.OCCModeBlockSTM)
+		require.True(t, result.OCCStats.Attempted)
+		require.False(t, result.OCCStats.Fallback)
+		require.Equal(t, sequential.GasUsed, result.GasUsed, "round %d", round)
+		require.Equal(t, sequential.Receipts, result.Receipts, "round %d", round)
+		require.Equal(t, sequential.ChangeSet, result.ChangeSet, "round %d", round)
+		result.Release()
+	}
+}
