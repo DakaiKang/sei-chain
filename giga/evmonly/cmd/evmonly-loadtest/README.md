@@ -12,9 +12,10 @@ The synthetic workload defaults to local EVM chain ID `1337`; override it with
 `--chain-id` when testing another signing domain.
 
 It currently generates pure EVM legacy transfer transactions, ERC20 transfer
-transactions using `sei-load`'s compiled contract runtime, and a contract-call
+transactions using `sei-load`'s compiled contract runtime, a contract-call
 workload that exercises nested StateDB
-snapshot/revert behavior. By default, each generated sender account has one
+snapshot/revert behavior, and a storage read/write workload whose transactions
+contend on a shared slot keyspace. By default, each generated sender account has one
 nonce-0 transaction and is funded in generated genesis state. Non-balance
 genesis state is committed to FlatKV before the measured blocks run. Recipients
 are unique by default so the transfer workloads exercise the optimistic
@@ -191,10 +192,19 @@ Useful knobs:
   possible transactions.
 - `--same-sender`: use one sender per native-transfer block and assign
   transaction nonces in block order.
-- `--workload`: workload type, either `transfer`, `erc20-transfer`, or
-  `snapshot-revert`.
+- `--workload`: workload type, one of `transfer`, `erc20-transfer`,
+  `snapshot-revert`, or `storage-rw`.
 - `--snapshot-revert-contract`, `--snapshot-revert-helper`: generated contract
   addresses used by `--workload=snapshot-revert`.
+- `--storage-records`: the number of distinct storage slots a `storage-rw`
+  block's transactions share. Slots are assigned by position within the block,
+  so `N` slots over `T` transactions leaves `T-N` of them contending when
+  `N < T` and none when `N >= T`. Unlike a shared recipient balance, a storage
+  slot is not commutative, so no delta or guard compression applies to it.
+- `--storage-op`: what each `storage-rw` transaction does to its slot: `rmw`
+  (load, add one, store; the default), `read`, or `write`.
+- `--storage-contract`: generated contract address used by
+  `--workload=storage-rw`.
 
 The command reports these saturation signals on stdout and at `/metrics`:
 

@@ -13,6 +13,7 @@ const (
 	WorkloadTransfer       = "transfer"
 	WorkloadERC20Transfer  = "erc20-transfer"
 	WorkloadSnapshotRevert = "snapshot-revert"
+	WorkloadStorageRW      = "storage-rw"
 
 	DefaultGenesisTimestamp = uint64(1_700_000_000)
 )
@@ -29,9 +30,17 @@ type Config struct {
 	ERC20Contract          common.Address
 	SnapshotRevertContract common.Address
 	SnapshotRevertHelper   common.Address
-	FixedRecipient         *common.Address
-	RecipientConflictRate  float64
-	SameSender             bool
+	StorageContract        common.Address
+	// StorageRecords is the number of distinct slots storage-rw transactions
+	// share. A block of T transactions over N slots has T-N of them contending
+	// when N < T.
+	StorageRecords int
+	// StorageOp is the operation each storage-rw transaction performs: rmw,
+	// read, or write.
+	StorageOp             string
+	FixedRecipient        *common.Address
+	RecipientConflictRate float64
+	SameSender            bool
 }
 
 type State interface {
@@ -52,6 +61,8 @@ func NewWorkload(kind string, cfg Config, state State) (Workload, error) {
 		return NewERC20TransferWorkload(cfg, state)
 	case WorkloadSnapshotRevert:
 		return NewSnapshotRevertWorkload(cfg, state), nil
+	case WorkloadStorageRW:
+		return NewStorageRWWorkload(cfg, state)
 	default:
 		return nil, fmt.Errorf("unsupported workload %q", kind)
 	}

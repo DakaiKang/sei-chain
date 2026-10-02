@@ -1049,6 +1049,10 @@ func TestWorkloadsMatchSequentialAcrossModes(t *testing.T) {
 		{name: "transfer with fees", args: []string{"--gas-price-wei=1000000000", "--min-gas-price-wei=1000000000", "--recipient-conflict-rate=0.5"}},
 		{name: "erc20 transfer", args: []string{"--workload=erc20-transfer"}},
 		{name: "snapshot revert", args: []string{"--workload=snapshot-revert"}},
+		{name: "storage rw contended", args: []string{"--workload=storage-rw", "--storage-records=4"}},
+		{name: "storage rw uncontended", args: []string{"--workload=storage-rw", "--storage-records=24"}},
+		{name: "storage read", args: []string{"--workload=storage-rw", "--storage-op=read", "--storage-records=4"}},
+		{name: "storage write", args: []string{"--workload=storage-rw", "--storage-op=write", "--storage-records=4"}},
 	}
 	type engine struct {
 		name    string
@@ -1095,6 +1099,79 @@ func TestWorkloadsMatchSequentialAcrossModes(t *testing.T) {
 					require.Equal(t, sequential.ChangeSet, result.ChangeSet)
 				})
 			}
+		})
+	}
+}
+
+// TestStorageRWWorkloadContendsOnSharedSlots: the keyspace flag is the
+// contention knob. A block of T transactions over N slots leaves T-N of them
+// contending when N < T, and none when N >= T.
+func TestStorageRWWorkloadContendsOnSharedSlots(t *testing.T) {
+	const txsPerBlock = 24
+	for _, tc := range []struct {
+		name          string
+		records       int
+		wantConflicts bool
+	}{
+		{name: "one slot", records: 1, wantConflicts: true},
+		{name: "fewer slots than txs", records: 4, wantConflicts: true},
+		{name: "one slot per tx", records: txsPerBlock, wantConflicts: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig([]string{
+				"--metrics-addr=", "--blocks=1", "--workload=storage-rw",
+				fmt.Sprintf("--txs-per-block=%d", txsPerBlock),
+				fmt.Sprintf("--storage-records=%d", tc.records),
+				"--gas-price-wei=0", "--min-gas-price-wei=0",
+			})
+			require.NoError(t, err)
+			require.Equal(t, uint64(defaultStorageTxGasLimit), cfg.txGasLimit)
+
+			state := newGeneratedState()
+			workload, err := scenarios.NewWorkload(cfg.workload, scenarioConfig(cfg), state)
+			require.NoError(t, err)
+			request, err := workload.BuildBlock(t.Context(), 1)
+			require.NoError(t, err)
+
+			executor := evmonly.NewExecutor(evmonly.Config{
+				MinGasPrice: cfg.minGasPrice,
+				OCCWorkers:  4,
+				OCCMode:     evmonly.OCCModeSnapshot,
+			}, withGeneratedState(state))
+			defer executor.Close()
+			result, err := executor.ExecuteBlock(t.Context(), request)
+			require.NoError(t, err)
+			defer result.Release()
+			require.Len(t, result.Txs, txsPerBlock)
+			for _, tx := range result.Txs {
+				require.Equal(t, ethtypes.ReceiptStatusSuccessful, tx.Status)
+				require.NoError(t, tx.Err)
+			}
+			if tc.wantConflicts {
+				// The snapshot engine reruns exactly the transactions that share
+				// a slot with a lower one.
+				require.Equal(t, uint64(txsPerBlock-tc.records), result.OCCStats.RerunCount)
+			} else {
+				require.Zero(t, result.OCCStats.RerunCount)
+			}
+		})
+	}
+}
+
+func TestStorageRWFlagsAreValidated(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown op", args: []string{"--storage-op=increment"}, want: "unsupported storage-op"},
+		{name: "zero records", args: []string{"--storage-records=0"}, want: "storage-records must be positive"},
+		{name: "fixed recipient", args: []string{"--recipient=0x00000000000000000000000000000000000000f1"}, want: "recipient is not supported"},
+		{name: "conflict rate", args: []string{"--recipient-conflict-rate=0.5"}, want: "recipient-conflict-rate is not supported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseConfig(append([]string{"--metrics-addr=", "--blocks=1", "--workload=storage-rw"}, tc.args...))
+			require.ErrorContains(t, err, tc.want)
 		})
 	}
 }
